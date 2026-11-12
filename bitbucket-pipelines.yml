@@ -1,0 +1,74 @@
+image: node:20
+
+options:
+    docker: true
+    size: 2x
+
+pipelines:
+    branches:
+        staging:
+            - step:
+                  name: Test (unit, integration, invariants)
+                  caches:
+                      - node
+                  script:
+                      - npm ci --no-audit --no-fund
+                      - npm run lint
+                      - npm test
+            - step:
+                  name: Deploy to Staging Server
+                  deployment: staging
+                  script:
+                      - pipe: atlassian/rsync-deploy:0.8.1
+                        variables:
+                            USER: $STAGING_SSH_USER
+                            SERVER: $STAGING_SSH_SERVER
+                            REMOTE_PATH: "/data/devenv/staging/sverse/backend/"
+                            LOCAL_PATH: "./"
+                            DEBUG: "true"
+                            EXTRA_ARGS: "--exclude=static --exclude=storage --exclude=node_modules --exclude=.env"
+                            DELETE_FLAG: "true"
+            - step:
+                  name: Restart PM2 Process
+                  script:
+                      - pipe: atlassian/ssh-run:0.2.4
+                        variables:
+                            SSH_USER: $STAGING_SSH_USER
+                            SERVER: $STAGING_SSH_SERVER
+                            MODE: script
+                            COMMAND: deploy_staging.sh
+        release:
+            - step:
+                  name: Test (unit, integration, invariants)
+                  caches:
+                      - node
+                  script:
+                      - npm ci --no-audit --no-fund
+                      - npm run lint
+                      - npm test
+            - step:
+                  deployment: Production
+                  services:
+                      - docker
+                  size: 2x
+                  script:
+                      # Build Docker image
+                      - docker build ./ -t $DOCKER_IMAGE_NAME --build-arg ENV=production
+
+                      # Login Docker Hub
+                      - echo $DOCKER_HUB_PASSWORD | docker login -u $DOCKER_HUB_USERNAME --password-stdin
+
+                      # Push image to Docker Hub
+                      - docker push $DOCKER_IMAGE_NAME
+
+                      # Deploy via SSH
+                      - pipe: atlassian/ssh-run:0.2.4
+                        variables:
+                            SSH_USER: root
+                            SERVER: $SERVER_IP
+                            MODE: script
+                            COMMAND: deploy.sh
+definitions:
+    services:
+        docker:
+            memory: 4096

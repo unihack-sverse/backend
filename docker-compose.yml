@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  # API process. RUN_JOBS=false keeps it free of background work; the worker owns the jobs.
+  web:
+    image: rstakaiito/sverse-be-v3-prd:latest
+    ports:
+      - "6081:5001"
+    restart: always
+    env_file: .env
+    environment:
+      - PORT=5001
+      - RUN_JOBS=false
+
+  # Chain dispatcher, indexer, reconciler, webhooks, telemetry rollups, epoch close.
+  # Exactly one worker should run per environment (job leases make extra replicas harmless).
+  worker:
+    image: rstakaiito/sverse-be-v3-prd:latest
+    restart: always
+    env_file: .env
+    command: ["node", "src/worker.js"]
