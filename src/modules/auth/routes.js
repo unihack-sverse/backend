@@ -5,7 +5,16 @@ import { byIp, rateLimit } from '../../middleware/rate-limit.js';
 import { requireSession } from '../../middleware/session-auth.js';
 import { validate } from '../../middleware/validate.js';
 import { authController } from './controllers/auth.controller.js';
-import { forgotSchema, loginSchema, registerSchema, resetSchema, verifyEmailSchema } from './schemas/auth.schema.js';
+import {
+  forgotSchema,
+  loginSchema,
+  registerSchema,
+  resetSchema,
+  verifyEmailSchema,
+  walletChallengeSchema,
+  walletLinkSchema,
+  walletVerifySchema,
+} from './schemas/auth.schema.js';
 
 export function authRoutes() {
   const router = Router();
@@ -14,7 +23,7 @@ export function authRoutes() {
     limit: 5,
     windowMs: 15 * 60 * 1000,
     durable: true,
-    key: (req) => `${String(req.body?.email ?? '').toLowerCase()}:${req.ip}`,
+    key: (req) => `${String(req.body?.email ?? req.body?.address ?? '').toLowerCase()}:${req.ip}`,
   });
 
   router.post(
@@ -24,6 +33,14 @@ export function authRoutes() {
     asyncHandler(authController.register),
   );
   router.post('/login', loginLimit, validate(loginSchema), asyncHandler(authController.login));
+  router.post(
+    '/wallet/challenge',
+    rateLimit({ name: 'wallet-challenge', limit: 30, windowMs: 15 * 60 * 1000, key: byIp, durable: true }),
+    validate(walletChallengeSchema),
+    asyncHandler(authController.walletChallenge),
+  );
+  router.post('/wallet/verify', loginLimit, validate(walletVerifySchema), asyncHandler(authController.walletVerify));
+  router.post('/wallet/link', requireSession, validate(walletLinkSchema), asyncHandler(authController.walletLink));
   router.post('/refresh', asyncHandler(authController.refresh));
   router.post('/logout', asyncHandler(authController.logout));
   router.get('/me', requireSession, asyncHandler(authController.me));

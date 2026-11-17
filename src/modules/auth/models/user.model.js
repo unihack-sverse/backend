@@ -1,3 +1,5 @@
+import { ethers } from 'ethers';
+
 import { ObjectId, Schema, Units, model } from '../../../db/model-helpers.js';
 import { ROLES } from '../../../config/constants.js';
 
@@ -6,9 +8,15 @@ const userSchema = new Schema(
     pid: { type: String, required: true, unique: true },
     handle: { type: String, required: true, unique: true, lowercase: true, trim: true },
     handleRaw: { type: String, required: true },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    email: { type: String, required: false, default: undefined, lowercase: true, trim: true },
     emailVerified: { type: Boolean, default: false },
-    passwordHash: { type: String, required: true, select: false },
+    passwordHash: { type: String, required: false, select: false },
+    walletAddress: {
+      type: String,
+      default: undefined,
+      set: (value) => (typeof value === 'string' && value.length > 0 ? ethers.getAddress(value) : value),
+    },
+    walletChainId: { type: Number, default: null },
     custodialAddress: { type: String, required: true },
     custodyIndex: { type: Number, required: true },
     roles: { type: [String], enum: ROLES, default: ['player'] },
@@ -54,6 +62,8 @@ const userSchema = new Schema(
   { timestamps: true },
 );
 
+userSchema.index({ email: 1 }, { unique: true, partialFilterExpression: { email: { $type: 'string' } } });
+userSchema.index({ walletAddress: 1 }, { unique: true, partialFilterExpression: { walletAddress: { $type: 'string' } } });
 userSchema.index({ studioId: 1 }, { sparse: true });
 userSchema.index({ 'referral.code': 1 }, { unique: true, partialFilterExpression: { 'referral.code': { $type: 'string' } } });
 userSchema.index({ reputation: -1 });

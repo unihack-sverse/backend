@@ -23,6 +23,25 @@ export const authController = {
     sendData(res, await passportService.me(user._id));
   },
 
+  async walletChallenge(req, res) {
+    sendData(res, await authService.createWalletChallenge(req.body));
+  },
+
+  async walletVerify(req, res) {
+    const device = { ipHash: ipHash(req), uaHash: sha256Hex(String(req.headers['user-agent'] ?? '')).slice(0, 32) };
+    const user = await authService.walletVerify(req.body, {
+      ...device,
+      onReferral: (created, code) => curationService.bindReferral({ referredUser: created, code, ...device }),
+    });
+    await startSession(req, res, user);
+    sendData(res, await passportService.me(user._id));
+  },
+
+  async walletLink(req, res) {
+    await authService.walletLink(req.user, req.body);
+    sendData(res, await passportService.me(req.user._id));
+  },
+
   async refresh(req, res) {
     try {
       const { user, accessToken, refreshToken } = await authService.refresh(req.cookies?.[REFRESH_COOKIE], context(req));
@@ -57,8 +76,9 @@ export const authController = {
   },
 
   async resendVerification(req, res) {
-    if (!req.user.emailVerified) await authService.sendVerification(req.user);
-    sendData(res, { sent: !req.user.emailVerified });
+    if (!req.user.email || req.user.emailVerified) return sendData(res, { sent: false });
+    await authService.sendVerification(req.user);
+    return sendData(res, { sent: true });
   },
 };
 

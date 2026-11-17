@@ -29,8 +29,10 @@ export const passportService = {
       id: user.pid,
       handle: user.handle,
       displayHandle: user.handleRaw,
-      email: user.email,
+      email: user.email ?? null,
       emailVerified: user.emailVerified,
+      walletAddress: user.walletAddress ?? null,
+      walletChainId: user.walletChainId ?? null,
       roles: user.roles,
       status: user.status,
       custodialAddress: user.custodialAddress,
@@ -86,6 +88,25 @@ export const passportService = {
       throw error;
     }
     return { creditedUnits: env.FAUCET_AMOUNT_UNITS.toString(), creditedSrv: fromUnits(env.FAUCET_AMOUNT_UNITS), ...(await this.balance(user)) };
+  },
+
+  async updateHandle(userId, handle) {
+    const normalizedHandle = handle.toLowerCase();
+    if (await UserModel.exists({ handle: normalizedHandle, _id: { $ne: userId } })) {
+      throw Conflict('handle_taken');
+    }
+    try {
+      const updated = await UserModel.findOneAndUpdate(
+        { _id: userId, status: { $ne: 'deleted' } },
+        { $set: { handle: normalizedHandle, handleRaw: handle } },
+        { new: true },
+      ).lean();
+      if (!updated) throw Unauthorized('missing_session');
+    } catch (error) {
+      if (error?.code === 11000) throw Conflict('handle_taken');
+      throw error;
+    }
+    return this.me(userId);
   },
 
   async findByPid(passportPid) {
