@@ -30,7 +30,7 @@ const FEE_TIERS = [
 
 export const studioService = {
   /** UC-18: studio + vault + bond accounts + creator role, one transaction. No KYB at this tier. */
-  async create(user, { handle, displayName, bio = '' }) {
+  async create(user, { handle, displayName, bio = '', grantTestFunds = false }) {
     if (user.studioId) throw Conflict('studio_exists');
     const normalized = handle.toLowerCase();
     if (await StudioModel.exists({ handle: normalized })) throw Conflict('handle_taken');
@@ -67,6 +67,22 @@ export const studioService = {
       );
       if (updated.modifiedCount !== 1) throw Conflict('studio_exists');
       await itemsService.ensureLicense(created, 'derivative', session);
+
+      if (grantTestFunds && env.FAUCET_ENABLED) {
+        await ledgerService.post(
+          {
+            legs: [
+              { accountId: await ledgerService.systemAccountId('onramp', session), direction: 'debit', amountUnits: env.FAUCET_AMOUNT_UNITS, reason: 'faucet' },
+              { accountId: vault._id, direction: 'credit', amountUnits: env.FAUCET_AMOUNT_UNITS, reason: 'faucet' },
+            ],
+            refType: 'studio',
+            refId: studioId,
+            memo: 'testnet studio grant',
+          },
+          session,
+        );
+      }
+
       return created.toObject();
     });
     return this.present(studio);
@@ -115,6 +131,8 @@ export const studioService = {
       feeTiers: FEE_TIERS.map((tier) => ({ tier: tier.tier, minStakeUnits: tier.minStakeUnits.toString(), feeBps: tier.bps() })).reverse(),
       withdrawnUnits: toBigInt(studio.withdrawnUnits).toString(),
       kycThresholdUnits: env.KYC_THRESHOLD_UNITS.toString(),
+      faucetEnabled: Boolean(env.FAUCET_ENABLED),
+      faucetAmountUnits: env.FAUCET_AMOUNT_UNITS.toString(),
       counters: {
         games: studio.counters?.games ?? 0,
         itemsSold: studio.counters?.itemsSold ?? 0,
@@ -168,6 +186,26 @@ export const studioService = {
         session,
       );
       await recalcFeeTier(studio._id, session);
+    });
+    return this.present(await StudioModel.findById(studio._id).lean());
+  },
+
+  async claimFaucet(user) {
+    if (!env.FAUCET_ENABLED) throw Forbidden('faucet_disabled');
+    const studio = await requireStudio(user);
+    await withTransaction(async (session) => {
+      await ledgerService.post(
+        {
+          legs: [
+            { accountId: await ledgerService.systemAccountId('onramp', session), direction: 'debit', amountUnits: env.FAUCET_AMOUNT_UNITS, reason: 'faucet' },
+            { accountId: studio.vaultAccountId, direction: 'credit', amountUnits: env.FAUCET_AMOUNT_UNITS, reason: 'faucet' },
+          ],
+          refType: 'studio',
+          refId: studio._id,
+          memo: 'testnet studio faucet',
+        },
+        session,
+      );
     });
     return this.present(await StudioModel.findById(studio._id).lean());
   },

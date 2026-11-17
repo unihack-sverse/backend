@@ -22,6 +22,7 @@ export function studioRoutes() {
         handle: z.string().regex(/^[a-z0-9._-]{3,30}$/i, 'handle must be 3-30 letters, digits, dot, dash or underscore'),
         displayName: z.string().min(2).max(60),
         bio: z.string().max(500).optional(),
+        grantTestFunds: z.boolean().optional(),
       }),
     }),
     asyncHandler(async (req, res) => sendData(res, await studioService.create(req.user, req.body), 201)),
@@ -49,6 +50,7 @@ export function studioRoutes() {
   );
   router.post('/studios/me/bond/stake', requireCreator, validate({ body: z.object({ amountUnits: positiveUnits }) }), asyncHandler(async (req, res) => sendData(res, await studioService.stake(req.user, req.body.amountUnits))));
   router.post('/studios/me/bond/unstake', requireCreator, validate({ body: z.object({ amountUnits: positiveUnits }) }), asyncHandler(async (req, res) => sendData(res, await studioService.unstake(req.user, req.body.amountUnits))));
+  router.post('/studios/me/faucet', requireCreator, asyncHandler(async (req, res) => sendData(res, await studioService.claimFaucet(req.user))));
 
   router.get('/studios/me/api-keys', requireCreator, asyncHandler(async (req, res) => sendCollection(res, await studioService.listApiKeys(req.user))));
   router.post(
