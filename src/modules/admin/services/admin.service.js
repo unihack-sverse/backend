@@ -12,14 +12,18 @@ export const adminService = {
   async users({ q, status, limit = 100 } = {}) {
     const filter = {};
     if (status) filter.status = status;
-    if (q) filter.$or = [{ handle: new RegExp(escape(q), 'i') }, { email: new RegExp(escape(q), 'i') }];
+    if (q) {
+      const pattern = new RegExp(escape(q), 'i');
+      filter.$or = [{ handle: pattern }, { email: pattern }, { walletAddress: pattern }];
+    }
     const users = await UserModel.find(filter).sort({ createdAt: -1 }).limit(Math.min(limit, 500)).lean();
     const wallets = await AccountModel.find({ ownerType: 'user', ownerId: { $in: users.map((user) => user._id) } }).lean();
     const walletByUser = new Map(wallets.map((wallet) => [String(wallet.ownerId), wallet]));
     return users.map((user) => ({
       id: user.pid,
       handle: user.handle,
-      email: user.email,
+      email: user.email ?? null,
+      walletAddress: user.walletAddress ?? null,
       roles: user.roles,
       status: user.status,
       reputation: user.reputation,

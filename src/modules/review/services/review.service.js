@@ -157,7 +157,7 @@ export const reviewService = {
     await writeAudit({ actor: { type: 'user', id: actor._id }, action: 'game.reject', targetType: 'game', targetId: game.pid, reason, requestId });
     const studio = await StudioModel.findById(game.studioId).lean();
     const owner = await UserModel.findById(studio.ownerUserId).select('email').lean();
-    if (owner) await mailer.send({ to: owner.email, template: 'game_rejected', vars: { title: game.title, reason } });
+    if (owner?.email) await mailer.send({ to: owner.email, template: 'game_rejected', vars: { title: game.title, reason } });
     eventBus.emit('game.rejected', { gameId: game.pid, studioId: studio._id, studioPid: studio.pid, reason });
     return { id: game.pid, status: game.status, reason };
   },
@@ -250,7 +250,7 @@ export const reviewService = {
       return { remaining, suspended };
     });
     const owner = await UserModel.findById(studio.ownerUserId).select('email').lean();
-    if (owner) await mailer.send({ to: owner.email, template: 'bond_slashed', vars: { amount: fromUnits(amount), reason, caseId } });
+    if (owner?.email) await mailer.send({ to: owner.email, template: 'bond_slashed', vars: { amount: fromUnits(amount), reason, caseId } });
     eventBus.emit('studio.bond_slashed', { studioId: studio._id, studioPid: studio.pid, amountUnits: amount.toString(), reason, caseId: caseId ?? null });
     return { studioId: studio.pid, slashedUnits: amount.toString(), remainingBondUnits: result.remaining.toString(), suspended: result.suspended };
   },

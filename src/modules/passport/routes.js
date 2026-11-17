@@ -9,6 +9,7 @@ import { NotFound } from '../../lib/errors.js';
 import { sendCollection, sendData } from '../../lib/respond.js';
 import { requireSession } from '../../middleware/session-auth.js';
 import { validate } from '../../middleware/validate.js';
+import { updateHandleSchema } from '../auth/schemas/auth.schema.js';
 import { checkoutService } from '../checkout/services/checkout.service.js';
 import { deedsService } from '../deeds/services/deeds.service.js';
 import { GameModel } from '../games/models/index.js';
@@ -22,6 +23,12 @@ export function passportRoutes() {
   const router = Router();
 
   router.get('/passport/me', requireSession, asyncHandler(async (req, res) => sendData(res, await passportService.me(req.user._id))));
+  router.patch(
+    '/passport/me/handle',
+    requireSession,
+    validate(updateHandleSchema),
+    asyncHandler(async (req, res) => sendData(res, await passportService.updateHandle(req.user._id, req.body.handle))),
+  );
   router.get(
     '/passport/me/inventory',
     requireSession,
