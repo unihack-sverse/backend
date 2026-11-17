@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { buy, cosmetic, createLiveGame, registerPlayer } from '../helpers.js';
+import { env } from '../../src/config/env.js';
 import { ChainOpModel } from '../../src/modules/chain/models/index.js';
 import { WithdrawalModel } from '../../src/modules/studios/models/index.js';
 import { ledgerService } from '../../src/modules/ledger/services/ledger.service.js';
@@ -18,6 +19,11 @@ describe('studio console (UC-18, UC-23, UC-24, UC-29)', () => {
     const me = await player.agent.get('/api/v1/auth/me');
     expect(me.body.data.roles).toContain('creator');
     expect((await player.agent.post('/api/v1/studios').send({ handle: 'another1', displayName: 'Again' })).body.error.code).toBe('studio_exists');
+
+    const otherPlayer = await registerPlayer();
+    const resWithGrant = await otherPlayer.agent.post('/api/v1/studios').send({ handle: `st${otherPlayer.handle}`.slice(0, 20), displayName: 'Funded', grantTestFunds: true });
+    expect(resWithGrant.status).toBe(201);
+    expect(resWithGrant.body.data.vault.balanceUnits).toBe('1000000000');
   });
 
   it('IDOR sweep: a creator cannot touch another studio’s resources', async () => {
@@ -107,5 +113,13 @@ describe('studio console (UC-18, UC-23, UC-24, UC-29)', () => {
     expect(res.body.data.netUnits).toBe('90000000');
     expect(res.body.data.buyers).toBe(1);
     expect(res.body.data.revenueSeries).toHaveLength(1);
+  });
+
+  it('studio faucet credits test SRV to the vault', async () => {
+    const player = await registerPlayer();
+    await player.agent.post('/api/v1/studios').send({ handle: `f${player.handle}`.slice(0, 20), displayName: 'Faucet Studio' });
+    const res = await player.agent.post('/api/v1/studios/me/faucet').send({});
+    expect(res.status).toBe(200);
+    expect(BigInt(res.body.data.vault.balanceUnits)).toBeGreaterThanOrEqual(BigInt(env.FAUCET_AMOUNT_UNITS));
   });
 });
