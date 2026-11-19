@@ -115,15 +115,18 @@ Then in `.env`: `CHAIN_ADAPTER=avalanche`, `AVALANCHE_RPC_URL=http://127.0.0.1:8
 
 ### Fuji testnet
 
-1. Create two dedicated Fuji keys (never reuse a personal key): a **deployer/admin** and a
+1. Create two dedicated Fuji keys (never reuse a personal key, and **never** reuse the `ADMIN_ADDRESS`/`DEPLOYER_PRIVATE_KEY` wallet for `RELAYER_PRIVATE_KEY`): a **deployer/admin** and a
    **relayer**. Fund both with test AVAX from the Avalanche faucet.
 2. `cd ../smartcontract && npm run export:abi` (keeps `src/adapters/chain/abi` in sync).
-3. Deploy: `ADMIN_ADDRESS=<multisig or admin> TREASURY_ADDRESS=<treasury> RELAYER_ADDRESS=<relayer> npm run deploy:fuji`,
-   then `npm run verify:fuji`. The manifest `deployments/fuji.json` records addresses and the
+3. Deploy: `ADMIN_ADDRESS=<multisig or admin> TREASURY_ADDRESS=<treasury> npm run deploy:fuji`,
+   then grant minimal operational roles to the separate relayer wallet:
+   `RELAYER_ADDRESS=<relayer> npm run grant:relayer:fuji`
+   (grants `SverseItems.{MINTER_ROLE,PLATFORM_ROLE}`, `SverseDeedRegistry.WITNESS_ROLE`, `SverseRewards.PUBLISHER_ROLE`, and `MockSRV.MINTER_ROLE` for Fuji `mint` settlement mode; pass `SKIP_MOCKSRV_MINTER=true` when using `transfer` mode),
+   and `npm run verify:fuji`. The manifest `deployments/fuji.json` records addresses and the
    start block for the indexer.
 4. Backend env: `CHAIN_ADAPTER=avalanche`, `AVALANCHE_CHAIN_ID=43113`,
    `AVALANCHE_RPC_URL=<dedicated RPC recommended>`, `AVALANCHE_DEPLOYMENT_FILE=…/fuji.json` (or the
-   explicit `*_ADDRESS` vars), `RELAYER_PRIVATE_KEY`, `CUSTODY_MNEMONIC`, `SRV_SETTLEMENT_MODE=mint`.
+   explicit `*_ADDRESS` vars), `RELAYER_PRIVATE_KEY` (must belong to `<relayer>`, separate from `ADMIN_ADDRESS`/`DEPLOYER_PRIVATE_KEY`), `CUSTODY_MNEMONIC`, `SRV_SETTLEMENT_MODE=mint`.
 5. Check `GET /admin/v1/chain/health`: every role must be `true` and the relayer must hold AVAX.
 6. Run exactly one worker (`npm run worker`, or the `worker` service in `docker-compose.yml`) and
    set `RUN_JOBS=false` on API replicas.
@@ -146,6 +149,11 @@ login); their old balance is posted as a balanced ledger credit. Studios/games f
 are replaced by the current seed.
 
 ## Operations runbook
+
+### Health & readiness
+
+- `GET /health` — liveness probe; returns `200 { ok: true, service: 'sverse-backend' }` whenever the Express process is up (does not check MongoDB).
+- `GET /ready` — readiness probe; checks `databaseStatus()` and returns `200` when MongoDB is ready (`503` otherwise) with `{ ok, db, adapters: { chain, chainId } }`.
 
 | Signal | Where | Action |
 |---|---|---|

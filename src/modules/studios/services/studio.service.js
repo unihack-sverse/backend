@@ -20,6 +20,7 @@ import { mapBalance, ledgerService } from '../../ledger/services/ledger.service.
 import { AccountModel } from '../../ledger/models/index.js';
 import { PlayRollupModel } from '../../telemetry/models/index.js';
 import { WebhookDeliveryModel } from '../../webhooks/models/index.js';
+import { assertSafeUrl } from '../../webhooks/services/webhooks.service.js';
 import { ApiKeyModel, StudioModel, WebhookEndpointModel, WithdrawalModel } from '../models/index.js';
 
 const FEE_TIERS = [
@@ -351,6 +352,7 @@ export const studioService = {
   },
 
   async createWebhook(user, { url, events }) {
+    validateWebhookUrl(url);
     const studio = await requireStudio(user);
     const secret = `whsec_${randomBase62(32)}`;
     const endpoint = await WebhookEndpointModel.create({
@@ -367,7 +369,10 @@ export const studioService = {
   async updateWebhook(user, endpointPid, patch) {
     const studio = await requireStudio(user);
     const set = {};
-    if (patch.url) set.url = patch.url;
+    if (patch.url !== undefined) {
+      validateWebhookUrl(patch.url);
+      set.url = patch.url;
+    }
     if (patch.events) set.events = patch.events;
     if (patch.status) {
       set.status = patch.status;
@@ -525,6 +530,14 @@ function mapApiKey(key, game) {
     revokedAt: key.revokedAt,
     createdAt: key.createdAt,
   };
+}
+
+function validateWebhookUrl(url) {
+  try {
+    assertSafeUrl(url);
+  } catch (error) {
+    throw Unprocessable('invalid_webhook_url', { message: error.message });
+  }
 }
 
 function mapWebhookEndpoint(endpoint) {

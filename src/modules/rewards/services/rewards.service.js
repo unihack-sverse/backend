@@ -261,16 +261,21 @@ export const rewardsService = {
       );
       await RewardClaimModel.updateOne({ _id: claim._id }, { $set: { ledgerTxId: txId } }, { session });
       const balance = await ledgerService.balance(destination, session);
+      // Single-source-of-truth reconciliation policy (Option A — Off-chain Ledger Authoritative):
+      // The off-chain ledger is the sole payout mechanism; on-chain SverseRewards only anchors
+      // the epoch Merkle root for auditability and reclaims any unclaimed/expired funds back to
+      // treasury via reclaimExpired. Omit merkleProof from claim responses so claimants cannot
+      // replay the proof directly against SverseRewards.claim(...) for a second payout.
       return {
         epochId: epoch.pid,
         claimId: claim.pid,
         claimed: true,
+        settlementMode: 'ledger',
         amountUnits: toBigInt(claim.amountUnits).toString(),
         amountSrv: fromUnits(claim.amountUnits),
         balanceUnits: balance.balanceUnits,
         balanceSrv: balance.balanceSrv,
         merkleRoot: epoch.merkleRoot,
-        merkleProof: claim.merkleProof,
       };
     });
   },

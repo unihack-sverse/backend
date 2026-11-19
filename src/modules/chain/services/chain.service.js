@@ -92,6 +92,15 @@ export const chainService = {
       await serial(() => reconcileOp(_id));
       reconciled += 1;
     }
+    const failedProjections = await ChainOpModel.find({ status: 'completed', projectionStatus: 'failed' })
+      .sort({ completedAt: 1 })
+      .limit(limit)
+      .select('_id')
+      .lean();
+    for (const { _id } of failedProjections) {
+      const retried = await serial(() => retryProjection(_id));
+      if (retried) reconciled += 1;
+    }
     return { reconciled };
   },
 
@@ -317,11 +326,7 @@ async function reconcileOp(opId) {
   }
 
   if (receipt.state === 'confirmed') {
-    await ChainOpModel.updateOne(
-      { _id: op._id, status: 'submitted' },
-      { $set: { status: 'chain_confirmed', confirmedAt: new Date(), blockNumber: receipt.blockNumber ?? null } },
-    );
-    await completeOp(op, receipt.result ?? {}, receipt.blockNumber);
+    await confirmOp(op, receipt);
     return;
   }
   if (receipt.state === 'dropped' && Date.now() - new Date(op.submittedAt).getTime() > DROPPED_GRACE_MS) {
@@ -333,7 +338,21 @@ async function reconcileOp(opId) {
           // Another transaction used this nonce. Re-check ours once more before re-preparing;
           // ref-guarded ops are additionally protected by lookupExisting() in prepare().
           const again = await adapter.checkReceipt(op);
-          if (again.state === 'dropped') await scheduleRetry(op, new Error('nonce_consumed'), { resetSubmission: true });
+          if (again.state === 'confirmed') {
+            await confirmOp(op, again);
+          } else if (again.state === 'dropped') {
+            if (op.kind === 'payout') {
+              // Payout has no on-chain idempotency ref: never clear rawTx/nonce or re-sign a second tx,
+              // and do not auto-reverse via onFailed in case the original tx landed on a lagging RPC.
+              await ChainOpModel.updateOne(
+                { _id: op._id },
+                { $set: { status: 'failed', lastError: 'payout_nonce_consumed_manual_reconcile', lockedUntil: null } },
+              );
+              logger.error({ op: op.pid, kind: op.kind, txHash: op.txHash }, 'payout_nonce_consumed_manual_reconcile');
+            } else {
+              await scheduleRetry(op, new Error('nonce_consumed'), { resetSubmission: true });
+            }
+          }
         }
       } catch (error) {
         await scheduleRetry(op, error, { resetSubmission: true });
@@ -348,8 +367,26 @@ async function reconcileOp(opId) {
   }
 }
 
-async function completeOp(op, result, blockNumber) {
+async function confirmOp(op, receipt) {
+  const confirmedTxHash = receipt.txHash && receipt.txHash !== op.txHash ? receipt.txHash : op.txHash;
+  await ChainOpModel.updateOne(
+    { _id: op._id, status: 'submitted' },
+    {
+      $set: {
+        status: 'chain_confirmed',
+        confirmedAt: new Date(),
+        blockNumber: receipt.blockNumber ?? null,
+        ...(confirmedTxHash ? { txHash: confirmedTxHash } : {}),
+      },
+    },
+  );
+  const nextOp = confirmedTxHash !== op.txHash ? { ...op, txHash: confirmedTxHash } : op;
+  await completeOp(nextOp, receipt.result ?? {}, receipt.blockNumber, confirmedTxHash);
+}
+
+async function completeOp(op, result, blockNumber, confirmedTxHash) {
   const merged = { ...(op.result ?? {}), ...result };
+  const resolvedTxHash = confirmedTxHash ?? result?.txHash ?? op.txHash;
   const updated = await ChainOpModel.findOneAndUpdate(
     { _id: op._id, status: { $ne: 'completed' } },
     {
@@ -359,19 +396,46 @@ async function completeOp(op, result, blockNumber) {
         completedAt: new Date(),
         lockedUntil: null,
         lastError: null,
+        projectionStatus: 'pending',
+        projectionError: null,
+        ...(resolvedTxHash && resolvedTxHash !== op.txHash ? { txHash: resolvedTxHash } : {}),
         ...(blockNumber !== null && blockNumber !== undefined ? { blockNumber } : {}),
       },
     },
     { new: true },
   ).lean();
   if (!updated) return;
+  await runProjection(updated, merged);
+}
+
+async function runProjection(op, result) {
   const handler = handlers.get(op.kind);
   try {
-    await handler?.onCompleted?.(updated, merged);
+    await handler?.onCompleted?.(op, result);
+    await ChainOpModel.updateOne(
+      { _id: op._id },
+      { $set: { projectionStatus: 'done', projectionError: null } },
+    );
+    eventBus.emit('chain.confirmed', { opId: op.pid, kind: op.kind, ref: op.ref, txHash: op.txHash });
   } catch (error) {
+    const message = String(error?.shortMessage ?? error?.message ?? error).slice(0, 500);
     logger.error({ err: error, op: op.pid }, 'chain_projection_failed');
+    await ChainOpModel.updateOne(
+      { _id: op._id },
+      { $set: { projectionStatus: 'failed', projectionError: message } },
+    );
   }
-  eventBus.emit('chain.confirmed', { opId: updated.pid, kind: updated.kind, ref: updated.ref, txHash: updated.txHash });
+}
+
+async function retryProjection(opId) {
+  const op = await ChainOpModel.findOneAndUpdate(
+    { _id: opId, status: 'completed', projectionStatus: 'failed' },
+    { $set: { projectionStatus: 'pending', projectionError: null } },
+    { new: true },
+  ).lean();
+  if (!op) return false;
+  await runProjection(op, op.result ?? {});
+  return true;
 }
 
 async function scheduleRetry(op, error, { resetSubmission = false } = {}) {

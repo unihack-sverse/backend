@@ -71,24 +71,24 @@ export class MockChainAdapter {
     return { ok: true, adapter: 'mock', chainId: 0 };
   }
 
-  #resultFor(op) {
-    switch (op.kind) {
-      case 'mint_item': {
-        const definitionId = BigInt(chainRef(op.payload.definition.ref)) % 1_000_000n;
-        if (!op.payload.definition.living) {
-          return { tokenId: `mock_${definitionId}`, chainDefinitionId: definitionId.toString() };
-        }
-        if (!this.mintedRefs.has(op.ref)) {
-          this.tokenCounter += 1;
-          this.mintedRefs.set(op.ref, `mock_${this.tokenCounter}`);
-        }
-        return { tokenId: this.mintedRefs.get(op.ref), chainDefinitionId: definitionId.toString() };
+  #resultHandlers = {
+    mint_item: (op) => {
+      const definitionId = BigInt(chainRef(op.payload.definition.ref)) % 1_000_000n;
+      if (!op.payload.definition.living) {
+        return { tokenId: `mock_${definitionId}`, chainDefinitionId: definitionId.toString() };
       }
-      case 'record_deed':
-        return { chainDeedId: mockHash('deed', op.ref) };
-      default:
-        return {};
-    }
+      if (!this.mintedRefs.has(op.ref)) {
+        this.tokenCounter += 1;
+        this.mintedRefs.set(op.ref, `mock_${this.tokenCounter}`);
+      }
+      return { tokenId: this.mintedRefs.get(op.ref), chainDefinitionId: definitionId.toString() };
+    },
+    record_deed: (op) => ({ chainDeedId: mockHash('deed', op.ref) }),
+  };
+
+  #resultFor(op) {
+    const handler = this.#resultHandlers[op.kind];
+    return handler ? handler(op) : {};
   }
 
   async #latency() {

@@ -18,6 +18,10 @@ export default defineConfig({
       CHAIN_ADAPTER: 'mock',
       LOG_LEVEL: 'silent',
       DISPUTE_WINDOW_DAYS: '30',
+      COOKIE_DOMAIN: '',
+      COOKIE_SECURE: 'false',
+      COOKIE_SAMESITE: 'lax',
+      WEBHOOK_ALLOW_PRIVATE_NET: 'true',
     },
   },
 });

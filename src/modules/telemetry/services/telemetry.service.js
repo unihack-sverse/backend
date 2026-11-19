@@ -23,24 +23,10 @@ export const telemetryService = {
     if (!user) throw NotFound('passport_not_found');
     const now = new Date();
 
-    // Overlapping sessions for the same passport + game: the newest wins.
-    const previous = await PlaySessionModel.find({ userId: user._id, gameId: game._id, closedAt: null }).lean();
-    for (const session of previous) {
-      await PlaySessionModel.updateOne({ _id: session._id, closedAt: null }, { $set: { closedAt: session.lastHeartbeatAt, closeReason: 'superseded' } });
-    }
     // First real telemetry replaces demo numbers for both the game and the passport.
     await GameModel.updateOne({ _id: game._id, statsSource: 'seed' }, { $set: { statsSource: 'telemetry' } });
     await UserModel.updateOne({ _id: user._id, reputationSource: 'seed' }, { $set: { reputationSource: 'computed' } });
-    const session = await PlaySessionModel.create({
-      pid: publicId('ses'),
-      userId: user._id,
-      gameId: game._id,
-      apiKeyId: apiKey._id,
-      startedAt: now,
-      lastHeartbeatAt: now,
-      clientVersion,
-      ipHash,
-    });
+    const session = await createOpenSession({ user, game, apiKey, now, clientVersion, ipHash });
     return presentSession(session.toObject(), user);
   },
 
@@ -199,6 +185,33 @@ async function findGameSession(game, sessionPid) {
   const session = await PlaySessionModel.findOne({ pid: sessionPid, gameId: game._id }).lean();
   if (!session) throw NotFound('session_not_found');
   return session;
+}
+
+async function createOpenSession({ user, game, apiKey, now, clientVersion, ipHash }) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    // Overlapping sessions for the same passport + game: the newest wins.
+    const previous = await PlaySessionModel.find({ userId: user._id, gameId: game._id, closedAt: null }).lean();
+    for (const prev of previous) {
+      await PlaySessionModel.updateOne(
+        { _id: prev._id, closedAt: null },
+        { $set: { closedAt: prev.lastHeartbeatAt, closeReason: 'superseded' } },
+      );
+    }
+    try {
+      return await PlaySessionModel.create({
+        pid: publicId('ses'),
+        userId: user._id,
+        gameId: game._id,
+        apiKeyId: apiKey._id,
+        startedAt: now,
+        lastHeartbeatAt: now,
+        clientVersion,
+        ipHash,
+      });
+    } catch (error) {
+      if (error?.code !== 11000 || attempt === 4) throw error;
+    }
+  }
 }
 
 async function closeAtLastHeartbeat(session) {

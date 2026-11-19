@@ -22,6 +22,10 @@ const playSessionSchema = new Schema(
 );
 
 playSessionSchema.index({ userId: 1, gameId: 1, closedAt: 1 });
+playSessionSchema.index(
+  { userId: 1, gameId: 1 },
+  { unique: true, partialFilterExpression: { closedAt: null } },
+);
 playSessionSchema.index({ closedAt: 1, lastHeartbeatAt: 1 });
 playSessionSchema.index({ closedAt: 1, rolledUpAt: 1 });
 playSessionSchema.index({ createdAt: 1 }, { expireAfterSeconds: 7776000 });

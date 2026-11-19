@@ -77,24 +77,20 @@ export class AvalancheChainAdapter {
     return { address: custodyAddress(kind, index) };
   }
 
+  #prepareHandlers = {
+    mint_item: (op) => this.#prepareMint(op),
+    record_deed: (op) => this.#prepareDeed(op),
+    transfer_item: (op) => this.#prepareItemTransfer(op),
+    burn_item: (op) => this.#prepareBurn(op),
+    publish_epoch: (op) => this.#preparePublishEpoch(op),
+    payout: (op) => this.#preparePayout(op),
+  };
+
   /** Returns `{ alreadyDone, result }` when the effect exists on-chain, else a signed tx. */
   async prepare(op) {
-    switch (op.kind) {
-      case 'mint_item':
-        return this.#prepareMint(op);
-      case 'record_deed':
-        return this.#prepareDeed(op);
-      case 'transfer_item':
-        return this.#prepareItemTransfer(op);
-      case 'burn_item':
-        return this.#prepareBurn(op);
-      case 'publish_epoch':
-        return this.#preparePublishEpoch(op);
-      case 'payout':
-        return this.#preparePayout(op);
-      default:
-        throw new Error(`Unsupported chain op kind: ${op.kind}`);
-    }
+    const handler = this.#prepareHandlers[op.kind];
+    if (!handler) throw new Error(`Unsupported chain op kind: ${op.kind}`);
+    return handler(op);
   }
 
   async broadcast(rawTx) {
@@ -114,11 +110,14 @@ export class AvalancheChainAdapter {
   }
 
   async checkReceipt(op) {
-    const receipt = await this.provider.getTransactionReceipt(op.txHash);
+    const receipt = op.txHash ? await this.provider.getTransactionReceipt(op.txHash) : null;
     if (!receipt) {
-      const pending = await this.provider.getTransaction(op.txHash);
+      const pending = op.txHash ? await this.provider.getTransaction(op.txHash) : null;
       if (pending) return { state: 'pending' };
-      const existing = await this.lookupExisting(op);
+      const prior = await this.#findConfirmedTx(op, { excludeTxHash: op.txHash });
+      if (prior?.pending) return { state: 'pending', blockNumber: prior.blockNumber };
+      if (prior) return { state: 'confirmed', blockNumber: prior.blockNumber, txHash: prior.txHash, result: prior.result };
+      const existing = await this.lookupExisting(op, { skipTxLookup: true });
       if (existing) return { state: 'confirmed', result: existing, blockNumber: null };
       return { state: 'dropped' };
     }
@@ -129,34 +128,69 @@ export class AvalancheChainAdapter {
     if (receipt.status === 1) {
       return { state: 'confirmed', blockNumber: receipt.blockNumber, result: this.#resultFromReceipt(op, receipt) };
     }
-    const existing = await this.lookupExisting(op);
+    const prior = await this.#findConfirmedTx(op, { excludeTxHash: op.txHash });
+    if (prior?.pending) return { state: 'pending', blockNumber: prior.blockNumber };
+    if (prior) return { state: 'confirmed', blockNumber: prior.blockNumber, txHash: prior.txHash, result: prior.result };
+    const existing = await this.lookupExisting(op, { skipTxLookup: true });
     if (existing) return { state: 'confirmed', blockNumber: receipt.blockNumber, result: existing };
     return { state: 'reverted', blockNumber: receipt.blockNumber };
   }
 
+  #lookupHandlers = {
+    mint_item: async (op) => {
+      const { SverseItems: items } = this.contracts;
+      const tokenId = await items.mintRefs(chainRef(op.ref));
+      if (tokenId === 0n) return null;
+      const definitionId = await items.definitionRefs(chainRef(op.payload.definition.ref));
+      return { tokenId: tokenId.toString(), chainDefinitionId: definitionId.toString() };
+    },
+    record_deed: async (op) => {
+      const { SverseItems: items, SverseDeedRegistry: deeds } = this.contracts;
+      const tokenId = BigInt(op.payload.tokenId);
+      const nonce = deedNonce(op.ref);
+      const used = await deeds.usedNonces(await items.getAddress(), tokenId, nonce);
+      return used ? { chainDeedId: await this.#deedId(tokenId, nonce) } : null;
+    },
+    publish_epoch: async (op) => {
+      const { SverseRewards: rewards } = this.contracts;
+      const epoch = await rewards.epochs(op.payload.epochNumber);
+      return epoch.merkleRoot === op.payload.root ? {} : null;
+    },
+  };
+
   /** The op's effect if it already exists on-chain (e.g. a replaced tx that still landed). */
-  async lookupExisting(op) {
-    const { SverseItems: items, SverseDeedRegistry: deeds, SverseRewards: rewards } = this.contracts;
-    switch (op.kind) {
-      case 'mint_item': {
-        const tokenId = await items.mintRefs(chainRef(op.ref));
-        if (tokenId === 0n) return null;
-        const definitionId = await items.definitionRefs(chainRef(op.payload.definition.ref));
-        return { tokenId: tokenId.toString(), chainDefinitionId: definitionId.toString() };
+  async lookupExisting(op, { skipTxLookup = false } = {}) {
+    const handler = this.#lookupHandlers[op.kind];
+    if (handler) return handler(op);
+    if (skipTxLookup) return null;
+    if (!['payout', 'transfer_item', 'burn_item'].includes(op.kind)) return null;
+    const found = await this.#findConfirmedTx(op);
+    if (!found || found.pending) return null;
+    return Object.keys(found.result).length ? { ...found.result, txHash: found.txHash } : { txHash: found.txHash };
+  }
+
+  async #findConfirmedTx(op, { excludeTxHash } = {}) {
+    const hashes = [...new Set([op.txHash, ...(op.txHashes ?? [])].filter(Boolean))].filter(
+      (hash) => hash !== excludeTxHash,
+    );
+    if (!hashes.length) return null;
+
+    let latest;
+    let pendingResult = null;
+    for (const hash of hashes) {
+      const receipt = await this.provider.getTransactionReceipt(hash);
+      if (!receipt || receipt.status !== 1) continue;
+      latest ??= await this.provider.getBlockNumber();
+      if (latest - receipt.blockNumber + 1 >= this.confirmations) {
+        return {
+          blockNumber: receipt.blockNumber,
+          txHash: hash,
+          result: this.#resultFromReceipt(op, receipt),
+        };
       }
-      case 'record_deed': {
-        const tokenId = BigInt(op.payload.tokenId);
-        const nonce = deedNonce(op.ref);
-        const used = await deeds.usedNonces(await items.getAddress(), tokenId, nonce);
-        return used ? { chainDeedId: await this.#deedId(tokenId, nonce) } : null;
-      }
-      case 'publish_epoch': {
-        const epoch = await rewards.epochs(op.payload.epochNumber);
-        return epoch.merkleRoot === op.payload.root ? {} : null;
-      }
-      default:
-        return null;
+      pendingResult ??= { pending: true, blockNumber: receipt.blockNumber };
     }
+    return pendingResult;
   }
 
   async health() {
@@ -318,6 +352,9 @@ export class AvalancheChainAdapter {
   }
 
   async #preparePayout(op) {
+    const existing = await this.lookupExisting(op);
+    if (existing) return { alreadyDone: true, result: existing };
+
     const { MockSRV: token } = this.contracts;
     const amount = BigInt(op.payload.amountUnits);
     // Testnet settles payouts by minting tSRV; mainnet transfers from the reserve wallet.
@@ -375,24 +412,27 @@ export class AvalancheChainAdapter {
   async #sign(wallet, tx) {
     const sender = wallet.address;
     const nonce = await this.#nextNonce(sender);
-    const fee = await this.provider.getFeeData();
-    const request = {
-      ...tx,
-      from: sender,
-      nonce,
-      chainId: this.chainIdValue,
-      type: 2,
-      maxFeePerGas: (fee.maxFeePerGas ?? fee.gasPrice) * 2n,
-      maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? 1n,
-    };
     try {
+      const fee = await this.provider.getFeeData();
+      const request = {
+        ...tx,
+        from: sender,
+        nonce,
+        chainId: this.chainIdValue,
+        type: 2,
+        maxFeePerGas: (fee.maxFeePerGas ?? fee.gasPrice) * 2n,
+        maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? 1n,
+      };
       request.gasLimit = ((await this.provider.estimateGas(request)) * 12n) / 10n;
+      const rawTx = await wallet.signTransaction(request);
+      return { rawTx, txHash: keccak256(rawTx), sender, nonce };
     } catch (error) {
-      this.localNonces.delete(sender);
+      // Roll back only this unused nonce so prerequisite #sendAndWait txs stay tracked.
+      if (this.localNonces.get(sender) === nonce + 1) {
+        this.localNonces.set(sender, nonce);
+      }
       throw error;
     }
-    const rawTx = await wallet.signTransaction(request);
-    return { rawTx, txHash: keccak256(rawTx), sender, nonce };
   }
 
   async #sendAndWait(wallet, tx) {
@@ -413,9 +453,9 @@ export class AvalancheChainAdapter {
     return nonce;
   }
 
-  #resultFromReceipt(op, receipt) {
-    const { SverseItems: items, SverseDeedRegistry: deeds } = this.contracts;
-    if (op.kind === 'mint_item') {
+  #receiptResultHandlers = {
+    mint_item: (receipt) => {
+      const { SverseItems: items } = this.contracts;
       for (const log of receipt.logs) {
         if (log.address.toLowerCase() !== String(items.target).toLowerCase()) continue;
         const parsed = items.interface.parseLog(log);
@@ -423,15 +463,22 @@ export class AvalancheChainAdapter {
           return { tokenId: parsed.args.tokenId.toString(), chainDefinitionId: parsed.args.definitionId.toString() };
         }
       }
-    }
-    if (op.kind === 'record_deed') {
+      return {};
+    },
+    record_deed: (receipt) => {
+      const { SverseDeedRegistry: deeds } = this.contracts;
       for (const log of receipt.logs) {
         if (log.address.toLowerCase() !== String(deeds.target).toLowerCase()) continue;
         const parsed = deeds.interface.parseLog(log);
         if (parsed?.name === 'DeedRecorded') return { chainDeedId: parsed.args.deedId };
       }
-    }
-    return {};
+      return {};
+    },
+  };
+
+  #resultFromReceipt(op, receipt) {
+    const handler = this.#receiptResultHandlers[op.kind];
+    return handler ? handler(receipt) : {};
   }
 
   async #deedId(tokenId, nonce) {
