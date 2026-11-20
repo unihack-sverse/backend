@@ -280,7 +280,6 @@ describe('AvalancheChainAdapter offline state transitions', () => {
 
   it('rolls back only the failed nonce in localNonces when estimateGas fails after prerequisite txs', async () => {
     const adapter = createOfflineAvalancheAdapter();
-    vi.spyOn(adapter.provider, 'waitForTransaction').mockResolvedValue({ status: 1, blockNumber: 98, logs: [] });
     // RPC pending nonce stays stale at 7 even after 2 prerequisite txs advance localNonces to 9.
     adapter.provider.getTransactionCount.mockResolvedValue(7);
     adapter.provider.estimateGas
@@ -308,6 +307,33 @@ describe('AvalancheChainAdapter offline state transitions', () => {
     const prepared = await adapter.prepare(epochOp);
     expect(prepared.nonce).toBe(9);
     expect(adapter.localNonces.get(adapter.relayerAddress)).toBe(10);
+  });
+
+  it('polls getTransactionReceipt for prerequisite txs without calling provider.waitForTransaction', async () => {
+    const adapter = createOfflineAvalancheAdapter();
+    adapter.provider.pollingInterval = 10;
+    const waitSpy = vi.spyOn(adapter.provider, 'waitForTransaction');
+    adapter.contracts.MockSRV.balanceOf.mockResolvedValueOnce(1000n);
+    adapter.contracts.MockSRV.allowance.mockResolvedValueOnce(0n);
+    adapter.provider.getTransactionReceipt
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ status: 1, blockNumber: 101, logs: [] });
+
+    const epochOp = {
+      kind: 'publish_epoch',
+      ref: 'epoch:poll_receipt',
+      payload: {
+        epochNumber: 2,
+        root: `0x${'e'.repeat(64)}`,
+        totalUnits: '1000',
+        claimDeadline: new Date(Date.now() + 86_400_000).toISOString(),
+      },
+    };
+
+    const prepared = await adapter.prepare(epochOp);
+    expect(prepared.rawTx).toMatch(/^0x/);
+    expect(waitSpy).not.toHaveBeenCalled();
+    expect(adapter.provider.getTransactionReceipt).toHaveBeenCalledTimes(2);
   });
 
   it('recovers already-confirmed payout hashes from op.txHashes in checkReceipt and prepare without re-signing', async () => {

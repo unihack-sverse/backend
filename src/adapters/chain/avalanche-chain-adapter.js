@@ -39,7 +39,12 @@ export class AvalancheChainAdapter {
     nonceFloor = async () => 0,
   } = {}) {
     this.chainIdValue = Number(chainId);
-    this.provider = new JsonRpcProvider(rpcUrl, this.chainIdValue, { staticNetwork: true, batchMaxCount: 20 });
+    this.provider = new JsonRpcProvider(rpcUrl, this.chainIdValue, {
+      staticNetwork: true,
+      batchMaxCount: 20,
+      // Disable ethers' 250ms request cache on local automine chains so fresh block numbers are never stale.
+      ...(this.chainIdValue === 31337 ? { cacheTimeout: -1 } : {}),
+    });
     // Local chains mine instantly; public RPCs get a gentler polling cadence.
     this.provider.pollingInterval = this.chainIdValue === 31337 ? 200 : 1000;
     this.relayer = new Wallet(relayerKey, this.provider);
@@ -451,7 +456,7 @@ export class AvalancheChainAdapter {
     }
   }
 
-  async #sendAndWait(wallet, tx) {
+  async #sendAndWait(wallet, tx, { timeoutMs = 120_000 } = {}) {
     const signed = await this.#sign(wallet, tx);
     await this.broadcast(signed.rawTx);
     const receipt = await this.provider.waitForTransaction(signed.txHash, 1, 120_000);
