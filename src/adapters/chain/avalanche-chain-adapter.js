@@ -459,8 +459,16 @@ export class AvalancheChainAdapter {
   async #sendAndWait(wallet, tx, { timeoutMs = 120_000 } = {}) {
     const signed = await this.#sign(wallet, tx);
     await this.broadcast(signed.rawTx);
-    const receipt = await this.provider.waitForTransaction(signed.txHash, 1, 120_000);
-    if (!receipt || receipt.status !== 1) throw new Error(`prerequisite_tx_failed:${signed.txHash}`);
+    const pollMs = Math.min(250, Math.max(50, this.provider.pollingInterval ?? 250));
+    const deadline = Date.now() + timeoutMs;
+    let receipt = null;
+    while (Date.now() < deadline) {
+      receipt = await this.provider.getTransactionReceipt(signed.txHash);
+      if (receipt) break;
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+    if (!receipt) throw new Error(`prerequisite_tx_timeout:${signed.txHash}`);
+    if (receipt.status !== 1) throw new Error(`prerequisite_tx_failed:${signed.txHash}`);
     return receipt;
   }
 
