@@ -62,4 +62,124 @@ describe('resilience: chain projection retry', () => {
     expect(calls).toBe(2);
     expect(confirmedEvents).toBe(1);
   });
+
+  it('detects and recovers stale pending projections in reconciliationReport and reconcileSubmitted without touching fresh pending ones', async () => {
+    const completedRefs = [];
+    const confirmedOpIds = [];
+    let listening = true;
+    eventBus.on('chain.confirmed', ({ opId }) => {
+      if (listening) confirmedOpIds.push(opId);
+    });
+
+    chainService.registerHandler('register_studio', {
+      async onCompleted(op) {
+        completedRefs.push(op.ref);
+      },
+      async onFailed() {},
+    });
+
+    const staleRefId = new mongoose.Types.ObjectId();
+    const freshRefId = new mongoose.Types.ObjectId();
+    const failedRefId = new mongoose.Types.ObjectId();
+
+    const staleOp = await ChainOpModel.create({
+      pid: `cop_stale_proj_${Date.now()}`,
+      kind: 'register_studio',
+      adapter: 'mock',
+      ref: `test-stale-proj:${staleRefId.toString()}`,
+      refType: 'studio',
+      refId: staleRefId,
+      payload: { handle: 'staleproj' },
+      status: 'completed',
+      txHash: `0x${'a'.repeat(64)}`,
+      projectionStatus: 'pending',
+      completedAt: new Date(Date.now() - 5 * 60_000),
+    });
+
+    const freshOp = await ChainOpModel.create({
+      pid: `cop_fresh_proj_${Date.now()}`,
+      kind: 'register_studio',
+      adapter: 'mock',
+      ref: `test-fresh-proj:${freshRefId.toString()}`,
+      refType: 'studio',
+      refId: freshRefId,
+      payload: { handle: 'freshproj' },
+      status: 'completed',
+      txHash: `0x${'b'.repeat(64)}`,
+      projectionStatus: 'pending',
+      completedAt: new Date(),
+    });
+
+    const failedOp = await ChainOpModel.create({
+      pid: `cop_failed_proj_${Date.now()}`,
+      kind: 'register_studio',
+      adapter: 'mock',
+      ref: `test-failed-proj:${failedRefId.toString()}`,
+      refType: 'studio',
+      refId: failedRefId,
+      payload: { handle: 'failedproj' },
+      status: 'completed',
+      txHash: `0x${'c'.repeat(64)}`,
+      projectionStatus: 'failed',
+      projectionError: 'boom',
+      completedAt: new Date(),
+    });
+
+    try {
+      // Backdate updatedAt on staleOp directly in MongoDB to simulate a crash mid-projection.
+      await ChainOpModel.collection.updateOne(
+        { _id: staleOp._id },
+        { $set: { updatedAt: new Date(Date.now() - 5 * 60_000) } },
+      );
+
+      const beforeReport = await chainService.reconciliationReport();
+      expect(beforeReport.healthy).toBe(false);
+      expect(beforeReport.projectionCounts).toEqual({ failed: 1, stalePending: 1 });
+      expect(beforeReport.failedProjections.map((o) => o.id)).toContain(failedOp.pid);
+      expect(beforeReport.stalePendingProjections.map((o) => o.id)).toContain(staleOp.pid);
+      expect(beforeReport.stalePendingProjections.map((o) => o.id)).not.toContain(freshOp.pid);
+
+      // Custom stalePendingMs override controls staleness cutoff.
+      const relaxedReport = await chainService.reconciliationReport({ stalePendingMs: 10 * 60_000 });
+      expect(relaxedReport.projectionCounts).toEqual({ failed: 1, stalePending: 0 });
+      expect(relaxedReport.stalePendingProjections).toEqual([]);
+
+      // Reconcile recovers staleOp and failedOp, but does NOT touch freshOp.
+      const res = await chainService.reconcileSubmitted();
+      expect(res.reconciled).toBeGreaterThanOrEqual(2);
+
+      const [staleAfter, failedAfter, freshAfter] = await Promise.all([
+        ChainOpModel.findById(staleOp._id).lean(),
+        ChainOpModel.findById(failedOp._id).lean(),
+        ChainOpModel.findById(freshOp._id).lean(),
+      ]);
+
+      expect(staleAfter.projectionStatus).toBe('done');
+      expect(staleAfter.projectionError).toBeNull();
+      expect(failedAfter.projectionStatus).toBe('done');
+      expect(freshAfter.projectionStatus).toBe('pending');
+
+      expect(completedRefs).toContain(staleOp.ref);
+      expect(completedRefs).toContain(failedOp.ref);
+      expect(completedRefs).not.toContain(freshOp.ref);
+      expect(confirmedOpIds.filter((id) => id === staleOp.pid)).toHaveLength(1);
+      expect(confirmedOpIds.filter((id) => id === freshOp.pid)).toHaveLength(0);
+
+      // Report is healthy again once failed and stale pending projections are resolved.
+      const afterReport = await chainService.reconciliationReport();
+      expect(afterReport.healthy).toBe(true);
+      expect(afterReport.projectionCounts).toEqual({ failed: 0, stalePending: 0 });
+      expect(afterReport.failedProjections).toEqual([]);
+      expect(afterReport.stalePendingProjections).toEqual([]);
+
+      // Second reconcile does not re-emit or re-run staleOp, and still skips freshOp.
+      await chainService.reconcileSubmitted();
+      expect(completedRefs.filter((ref) => ref === staleOp.ref)).toHaveLength(1);
+      expect(confirmedOpIds.filter((id) => id === staleOp.pid)).toHaveLength(1);
+      expect(completedRefs).not.toContain(freshOp.ref);
+    } finally {
+      listening = false;
+      await ChainOpModel.deleteMany({ _id: { $in: [staleOp._id, freshOp._id, failedOp._id] } });
+    }
+  });
 });

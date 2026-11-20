@@ -14,7 +14,8 @@
     "test:watch": "vitest",
     "test:chain": "vitest run --config vitest.chain.config.js",
     "seed:reset": "node scripts/reseed.js",
-    "dev:db": "node scripts/dev-db.js"
+    "dev:db": "node scripts/dev-db.js",
+    "db:sync-indexes": "node scripts/sync-indexes.js"
   },
   "dependencies": {
     "argon2": "^0.44.0",

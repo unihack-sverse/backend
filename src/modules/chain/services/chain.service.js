@@ -9,6 +9,7 @@ import { ChainCursorModel, ChainEventModel, ChainOpModel } from '../models/index
 
 const MAX_ATTEMPTS = 8;
 const LOCK_MS = 120_000;
+export const PROJECTION_STALE_MS = 2 * 60_000;
 const DROPPED_GRACE_MS = env.CHAIN_DROPPED_GRACE_MS;
 const handlers = new Map();
 let queue = Promise.resolve();
@@ -81,7 +82,7 @@ export const chainService = {
     return { processed };
   },
 
-  async reconcileSubmitted({ limit = 50 } = {}) {
+  async reconcileSubmitted({ limit = 50, stalePendingMs = PROJECTION_STALE_MS } = {}) {
     const submitted = await ChainOpModel.find({ status: { $in: ['submitted', 'chain_confirmed'] } })
       .sort({ submittedAt: 1 })
       .limit(limit)
@@ -92,13 +93,20 @@ export const chainService = {
       await serial(() => reconcileOp(_id));
       reconciled += 1;
     }
-    const failedProjections = await ChainOpModel.find({ status: 'completed', projectionStatus: 'failed' })
+    const staleBefore = new Date(Date.now() - stalePendingMs);
+    const pendingProjections = await ChainOpModel.find({
+      status: 'completed',
+      $or: [
+        { projectionStatus: 'failed' },
+        { projectionStatus: 'pending', updatedAt: { $lte: staleBefore } },
+      ],
+    })
       .sort({ completedAt: 1 })
       .limit(limit)
       .select('_id')
       .lean();
-    for (const { _id } of failedProjections) {
-      const retried = await serial(() => retryProjection(_id));
+    for (const { _id } of pendingProjections) {
+      const retried = await serial(() => retryProjection(_id, { stalePendingMs }));
       if (retried) reconciled += 1;
     }
     return { reconciled };
@@ -189,17 +197,40 @@ export const chainService = {
     };
   },
 
-  async reconciliationReport() {
+  async reconciliationReport({ stalePendingMs = PROJECTION_STALE_MS } = {}) {
     const stuckBefore = new Date(Date.now() - 10 * 60_000);
-    const [stuck, failed, counts] = await Promise.all([
+    const staleBefore = new Date(Date.now() - stalePendingMs);
+    const [
+      stuck,
+      failed,
+      failedProjections,
+      stalePendingProjections,
+      failedProjectionCount,
+      stalePendingProjectionCount,
+      counts,
+    ] = await Promise.all([
       ChainOpModel.find({ status: { $in: ['created', 'submitted'] }, createdAt: { $lt: stuckBefore } }).limit(100).lean(),
       ChainOpModel.find({ status: 'failed' }).sort({ updatedAt: -1 }).limit(100).lean(),
+      ChainOpModel.find({ status: 'completed', projectionStatus: 'failed' }).sort({ updatedAt: -1 }).limit(100).lean(),
+      ChainOpModel.find({ status: 'completed', projectionStatus: 'pending', updatedAt: { $lte: staleBefore } }).sort({ updatedAt: 1 }).limit(100).lean(),
+      ChainOpModel.countDocuments({ status: 'completed', projectionStatus: 'failed' }),
+      ChainOpModel.countDocuments({ status: 'completed', projectionStatus: 'pending', updatedAt: { $lte: staleBefore } }),
       ChainOpModel.aggregate([{ $group: { _id: { kind: '$kind', status: '$status' }, n: { $sum: 1 } } }]),
     ]);
     return {
-      healthy: stuck.length === 0 && failed.length === 0,
+      healthy:
+        stuck.length === 0 &&
+        failed.length === 0 &&
+        failedProjectionCount === 0 &&
+        stalePendingProjectionCount === 0,
       stuck: stuck.map(mapOp),
       failed: failed.map(mapOp),
+      failedProjections: failedProjections.map(mapOp),
+      stalePendingProjections: stalePendingProjections.map(mapOp),
+      projectionCounts: {
+        failed: failedProjectionCount,
+        stalePending: stalePendingProjectionCount,
+      },
       byKind: counts.map((row) => ({ kind: row._id.kind, status: row._id.status, count: row.n })),
     };
   },
@@ -468,9 +499,17 @@ async function runProjection(op, result) {
   }
 }
 
-async function retryProjection(opId) {
+async function retryProjection(opId, { stalePendingMs = PROJECTION_STALE_MS } = {}) {
+  const staleBefore = new Date(Date.now() - stalePendingMs);
   const op = await ChainOpModel.findOneAndUpdate(
-    { _id: opId, status: 'completed', projectionStatus: 'failed' },
+    {
+      _id: opId,
+      status: 'completed',
+      $or: [
+        { projectionStatus: 'failed' },
+        { projectionStatus: 'pending', updatedAt: { $lte: staleBefore } },
+      ],
+    },
     { $set: { projectionStatus: 'pending', projectionError: null } },
     { new: true },
   ).lean();
