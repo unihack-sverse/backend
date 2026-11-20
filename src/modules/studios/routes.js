@@ -8,8 +8,6 @@ import { requireCreator, requireSession } from '../../middleware/session-auth.js
 import { assetUrl, evmAddress, httpUrl, positiveUnits, validate } from '../../middleware/validate.js';
 import { rewardsService } from '../rewards/services/rewards.service.js';
 import { requireStudio, studioService } from './services/studio.service.js';
-import { assertSafeUrl } from '../webhooks/services/webhooks.service.js';
-import { Unprocessable } from '../../lib/errors.js';
 
 export function studioRoutes() {
   const router = Router();
@@ -74,14 +72,7 @@ export function studioRoutes() {
     '/studios/me/webhooks',
     requireCreator,
     validate({ body: webhookBody }),
-    asyncHandler(async (req, res) => {
-      try {
-        assertSafeUrl(req.body.url);
-      } catch (error) {
-        throw Unprocessable('invalid_webhook_url', { message: error.message });
-      }
-      sendData(res, await studioService.createWebhook(req.user, req.body), 201);
-    }),
+    asyncHandler(async (req, res) => sendData(res, await studioService.createWebhook(req.user, req.body), 201)),
   );
   router.patch(
     '/studios/me/webhooks/:id',

@@ -8,6 +8,11 @@ emitter.setMaxListeners(50);
 /**
  * In-process domain events (01 §7). Handlers run after the response path and must never
  * throw into the emitter; durable work is persisted by the handler (webhook deliveries, posts).
+ *
+ * Note on durability: replacing this fire-and-forget bus with a transactional outbox would
+ * require every emitter call site to pass an active Mongo session and alter post-response
+ * handler timing/behaviour. Intentionally kept in-process here; full durable outbox is
+ * deferred to the roadmap.
  */
 export const eventBus = {
   on(event, handler) {

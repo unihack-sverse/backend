@@ -61,6 +61,33 @@ const itemBody = z.object({
   status: z.enum(['draft', 'active']).optional(),
 });
 
+const mappingKey = z.string().regex(/^[a-zA-Z0-9_.-]{1,64}$/);
+const finiteNumber = z.number().finite();
+const numericRange = z.tuple([finiteNumber, finiteNumber]).refine(([min, max]) => min <= max, {
+  message: 'range min must be <= max',
+});
+
+const mappingRuleSchema = z
+  .object({
+    from: mappingKey.optional(),
+    passthrough: z.boolean().optional(),
+    values: z.array(z.union([z.string().max(64), finiteNumber, z.boolean()])).max(50).optional(),
+    curve: z.enum(['linear']).optional(),
+    inRange: numericRange.optional(),
+    outRange: numericRange.optional(),
+    round: z.boolean().optional(),
+  })
+  .strict()
+  .superRefine((rule, ctx) => {
+    if (!rule.passthrough && !rule.outRange) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['outRange'],
+        message: 'outRange is required when passthrough is not true',
+      });
+    }
+  });
+
 const envelopeBody = z.object({
   acceptsTierMax: z.enum(INTEROP_TIERS),
   accepts: z
@@ -68,8 +95,11 @@ const envelopeBody = z.object({
       z.object({
         schemaId: z.string().max(80),
         tierMax: z.enum(INTEROP_TIERS),
-        powerTierRange: z.tuple([z.number(), z.number()]).optional(),
-        mapping: z.record(z.any()).default({}),
+        powerTierRange: z.tuple([finiteNumber, finiteNumber]).optional(),
+        mapping: z
+          .record(mappingKey, mappingRuleSchema)
+          .refine((rules) => Object.keys(rules).length <= 32, { message: 'mapping cannot exceed 32 rules' })
+          .default({}),
         clampPolicy: z.enum(['reject', 'clamp']).default('reject'),
       }),
     )

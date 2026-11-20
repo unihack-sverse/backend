@@ -106,24 +106,32 @@ secret manager/HSM.
 
 ```bash
 cd ../smartcontract && npm run node                                   # terminal A
-RELAYER_ADDRESS=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 npm run deploy:local   # terminal B
+npm run deploy:local                                                  # terminal B
+RELAYER_ADDRESS=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 npm run grant:relayer:local
 ```
 
-Then in `.env`: `CHAIN_ADAPTER=avalanche`, `AVALANCHE_RPC_URL=http://127.0.0.1:8545`,
-`AVALANCHE_CHAIN_ID=31337`, `AVALANCHE_DEPLOYMENT_FILE=../smartcontract/deployments/localhost.json`,
+`deploy.js` does not read `RELAYER_ADDRESS`, so operational roles must be granted separately via
+`grant:relayer:local`. Then in `.env`: `CHAIN_ADAPTER=avalanche`,
+`AVALANCHE_RPC_URL=http://127.0.0.1:8545`, `AVALANCHE_CHAIN_ID=31337`,
+`AVALANCHE_DEPLOYMENT_FILE=../smartcontract/deployments/localhost.json`,
 `RELAYER_PRIVATE_KEY=<hardhat account #1 key>`, and restart.
 
 ### Fuji testnet
 
-1. Create two dedicated Fuji keys (never reuse a personal key): a **deployer/admin** and a
+1. Create two dedicated Fuji keys (never reuse a personal key, and **never** reuse the `ADMIN_ADDRESS`/`DEPLOYER_PRIVATE_KEY` wallet for `RELAYER_PRIVATE_KEY`): a **deployer/admin** and a
    **relayer**. Fund both with test AVAX from the Avalanche faucet.
 2. `cd ../smartcontract && npm run export:abi` (keeps `src/adapters/chain/abi` in sync).
-3. Deploy: `ADMIN_ADDRESS=<multisig or admin> TREASURY_ADDRESS=<treasury> RELAYER_ADDRESS=<relayer> npm run deploy:fuji`,
-   then `npm run verify:fuji`. The manifest `deployments/fuji.json` records addresses and the
-   start block for the indexer.
+3. Deploy: `ADMIN_ADDRESS=<multisig or admin> TREASURY_ADDRESS=<treasury> npm run deploy:fuji`,
+   then grant minimal operational roles to the separate relayer wallet:
+   `RELAYER_ADDRESS=<relayer> npm run grant:relayer:fuji`
+   (grants `SverseItems.{MINTER_ROLE,PLATFORM_ROLE}`, `SverseDeedRegistry.WITNESS_ROLE`, `SverseRewards.PUBLISHER_ROLE`, and `MockSRV.MINTER_ROLE` for Fuji `mint` settlement mode; pass `SKIP_MOCKSRV_MINTER=true` when using `transfer` mode),
+   and `npm run verify:fuji`. The manifest `deployments/fuji.json` records contract addresses and
+   deployment metadata only (not `startBlock`); set `AVALANCHE_START_BLOCK` in `.env` if you want
+   the indexer to start from the deploy block instead of `0`.
 4. Backend env: `CHAIN_ADAPTER=avalanche`, `AVALANCHE_CHAIN_ID=43113`,
    `AVALANCHE_RPC_URL=<dedicated RPC recommended>`, `AVALANCHE_DEPLOYMENT_FILE=…/fuji.json` (or the
-   explicit `*_ADDRESS` vars), `RELAYER_PRIVATE_KEY`, `CUSTODY_MNEMONIC`, `SRV_SETTLEMENT_MODE=mint`.
+   explicit `*_ADDRESS` vars), `AVALANCHE_START_BLOCK=<deploy block>` (optional; defaults to `0`),
+   `RELAYER_PRIVATE_KEY` (must belong to `<relayer>`, separate from `ADMIN_ADDRESS`/`DEPLOYER_PRIVATE_KEY`), `CUSTODY_MNEMONIC`, `SRV_SETTLEMENT_MODE=mint`.
 5. Check `GET /admin/v1/chain/health`: every role must be `true` and the relayer must hold AVAX.
 6. Run exactly one worker (`npm run worker`, or the `worker` service in `docker-compose.yml`) and
    set `RUN_JOBS=false` on API replicas.
@@ -147,6 +155,11 @@ are replaced by the current seed.
 
 ## Operations runbook
 
+### Health & readiness
+
+- `GET /health` — liveness probe; returns `200 { ok: true, service: 'sverse-backend' }` whenever the Express process is up (does not check MongoDB).
+- `GET /ready` — readiness probe; checks `databaseStatus()` and returns `200` when MongoDB is ready (`503` otherwise) with `{ ok, db, adapters: { chain, chainId } }`.
+
 | Signal | Where | Action |
 |---|---|---|
 | `balanced: false` | `GET /admin/v1/ledger/trial-balance` (poll every 5 min) | Page on-call. Freeze withdrawals (pause payouts by stopping the worker), find `driftAccounts`, reconcile from `ledgerEntries` — never edit entries, post reversals. |
@@ -159,3 +172,13 @@ are replaced by the current seed.
 Data policy: seeded studios, games, users and catalog are demo data. Games and passports seeded
 with demo numbers carry `statsSource: 'seed'` / `reputationSource: 'seed'` until real telemetry
 arrives, and the UI labels them — they are never traction.
+
+## Known limitations
+
+1. **Refunded limited-supply items can hit on-chain `SupplyExceeded`:** `SverseItems.burn` does not decrement `totalMinted`, whereas off-chain refunds release `supply.minted`; re-selling a refunded limited-supply item up to its off-chain cap can therefore revert on-chain with `SupplyExceeded`.
+2. **Parallel on-chain reward claims on `SverseRewards`:** `SverseRewards.claim` remains callable directly on-chain alongside off-chain ledger claims. The off-chain ledger is currently the authoritative payout source (`settlementMode: 'ledger'`) and `merkleProof` is omitted from API responses (though proofs are still stored on `RewardClaimModel`).
+3. **`publish` step can stay stuck in `running` after a crash:** `publishService.runStep` uses a CAS that only claims `pending`, `failed`, or `done` steps and has no stale-lease recovery, so a crash mid-step leaves that step stuck in `running` (`409 step_already_running`).
+4. **In-memory custodial HD root:** `src/adapters/chain/custody.js` holds `CUSTODY_MNEMONIC` and derived HD wallets in process RAM; KMS/HSM integration is not yet implemented.
+5. **Symmetric entitlement JWTs:** offline entitlement tokens (`src/lib/entitlement.js`, `src/lib/jwt.js`) are signed with symmetric `HS256` using a shared `ENTITLEMENT_SECRET` rather than asymmetric keys/JWKS.
+6. **Off-chain commerce and marketplace settlement:** primary checkout and secondary marketplace trades are orchestrated off-chain (double-entry ledger + `SverseItems` mint/transfer outbox ops) and do not call `SverseStore` or `SverseMarketplace` on-chain.
+7. **Single-chain only:** the chain adapter supports one configured network (`mock` or a single Avalanche C-Chain network); multi-chain support is not implemented.

@@ -86,18 +86,18 @@ export function isOfflineTarget(url, mode = env.REVIEW_SCAN_MODE) {
   }
 }
 
-async function resolveTarget(url, allowPrivate) {
+export async function resolveTarget(url, allowPrivate, lookup = dns.promises.lookup, { allowAnyHttp = false } = {}) {
   const hostname = url.hostname.replace(/^\[|\]$/g, '');
   if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new FetchError('unsupported_protocol', `unsupported protocol ${url.protocol}`);
   if (url.username || url.password) throw new FetchError('credentials_in_url', 'URL must not embed credentials');
-  if (url.protocol === 'http:' && !(allowPrivate && LOCAL_HOSTS.has(url.hostname.toLowerCase()))) {
+  if (url.protocol === 'http:' && !(allowPrivate && (allowAnyHttp || LOCAL_HOSTS.has(url.hostname.toLowerCase())))) {
     throw new FetchError('https_required', 'URL must be served over HTTPS');
   }
   let addresses;
   if (net.isIP(hostname)) addresses = [{ address: hostname, family: net.isIP(hostname) }];
   else {
     try {
-      addresses = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+      addresses = await lookup(hostname, { all: true, verbatim: true });
     } catch (error) {
       throw new FetchError('dns_failed', `DNS lookup failed for ${hostname} (${error.code ?? error.message})`);
     }
@@ -109,14 +109,14 @@ async function resolveTarget(url, allowPrivate) {
   return addresses[0];
 }
 
-function requestOnce(url, target, { signal, accept }) {
+export function requestOnce(url, target, { signal, accept, method = 'GET', headers, body } = {}) {
   return new Promise((resolve, reject) => {
     const client = url.protocol === 'https:' ? https : http;
     const req = client.request(
       url,
       {
-        method: 'GET',
-        headers: { 'user-agent': 'SverseReviewBot/1.0', accept: accept ?? '*/*', 'accept-encoding': 'identity' },
+        method,
+        headers: headers ?? { 'user-agent': 'SverseReviewBot/1.0', accept: accept ?? '*/*', 'accept-encoding': 'identity' },
         // Pin the connection to the address we already validated (defeats DNS rebinding).
         lookup: (_host, options, callback) => {
           if (options?.all) callback(null, [{ address: target.address, family: target.family }]);
@@ -127,7 +127,7 @@ function requestOnce(url, target, { signal, accept }) {
       resolve,
     );
     req.on('error', reject);
-    req.end();
+    req.end(body);
   });
 }
 

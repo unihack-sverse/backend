@@ -1,10 +1,13 @@
-import { isProduction } from '../../../config/env.js';
+import net from 'node:net';
+
+import { env, isProduction } from '../../../config/env.js';
 import { WEBHOOK_EVENTS } from '../../../config/constants.js';
 import { eventBus } from '../../../lib/event-bus.js';
 import { signWebhook } from '../../../lib/hmac.js';
 import { publicId } from '../../../lib/ids.js';
 import { logger } from '../../../lib/logger.js';
 import { open } from '../../../lib/secret-box.js';
+import { FetchError, isPrivateAddress, requestOnce, resolveTarget } from '../../review/scanners/safe-fetch.js';
 import { StudioModel, WebhookEndpointModel } from '../../studios/models/index.js';
 import { WebhookDeliveryModel } from '../models/index.js';
 
@@ -37,7 +40,7 @@ export const webhooksService = {
   },
 
   /** At-least-once delivery with exponential backoff (1m → 16m), then dead-letter. */
-  async deliverDue({ limit = 50, fetchImpl = fetch } = {}) {
+  async deliverDue({ limit = 50, fetchImpl = null, allowPrivate = env.WEBHOOK_ALLOW_PRIVATE_NET, lookup } = {}) {
     const due = await WebhookDeliveryModel.find({ status: { $in: ['pending', 'retrying'] }, nextRetryAt: { $lte: new Date() } })
       .sort({ nextRetryAt: 1 })
       .limit(limit)
@@ -52,27 +55,40 @@ export const webhooksService = {
       const rawBody = JSON.stringify(delivery.payload);
       let status = null;
       let error = null;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
       try {
-        assertSafeUrl(endpoint.url);
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-        const response = await fetchImpl(endpoint.url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'User-Agent': 'Sverse-Webhooks/1',
-            'X-Sverse-Event': delivery.event,
-            'X-Sverse-Delivery': delivery.pid,
-            'X-Sverse-Signature': signWebhook(open(endpoint.signingSecretEnc), rawBody),
-          },
-          body: rawBody,
-          signal: controller.signal,
-          redirect: 'manual',
-        });
-        clearTimeout(timer);
-        status = response.status;
+        const target = await resolveSafeWebhookTarget(endpoint.url, { allowPrivate, lookup });
+        const headers = {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Sverse-Webhooks/1',
+          'X-Sverse-Event': delivery.event,
+          'X-Sverse-Delivery': delivery.pid,
+          'X-Sverse-Signature': signWebhook(open(endpoint.signingSecretEnc), rawBody),
+        };
+        if (fetchImpl) {
+          const response = await fetchImpl(endpoint.url, {
+            method: 'POST',
+            headers,
+            body: rawBody,
+            signal: controller.signal,
+            redirect: 'manual',
+          });
+          status = response.status;
+        } else {
+          const response = await requestOnce(new URL(endpoint.url), target, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Length': String(Buffer.byteLength(rawBody)) },
+            body: rawBody,
+            signal: controller.signal,
+          });
+          status = response.statusCode ?? 0;
+          response.destroy();
+        }
       } catch (caught) {
         error = String(caught?.message ?? caught).slice(0, 300);
+      } finally {
+        clearTimeout(timer);
       }
 
       const attempts = delivery.attempts + 1;
@@ -105,16 +121,28 @@ export const webhooksService = {
   },
 };
 
-export function assertSafeUrl(url) {
+export function assertSafeUrl(url, { allowPrivate = env.WEBHOOK_ALLOW_PRIVATE_NET } = {}) {
   const parsed = new URL(url);
-  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('unsupported_protocol');
-  if (!isProduction) return;
-  if (parsed.protocol !== 'https:') throw new Error('https_required');
-  const host = parsed.hostname;
-  // Block obvious SSRF targets in production: loopback, link-local, RFC1918, metadata services.
-  if (/^(localhost|127\.|10\.|192\.168\.|169\.254\.|0\.|\[?::1\]?$|.*\.internal$)/i.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) {
-    throw new Error('private_address_blocked');
+  if (!['http:', 'https:'].includes(parsed.protocol)) throw new FetchError('unsupported_protocol', `unsupported protocol ${parsed.protocol}`);
+  if (parsed.username || parsed.password) throw new FetchError('credentials_in_url', 'URL must not embed credentials');
+  if (allowPrivate) return parsed;
+  if (parsed.protocol !== 'https:') throw new FetchError('https_required', 'URL must be served over HTTPS');
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
+  if (
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.internal') ||
+    hostname.endsWith('.local') ||
+    (net.isIP(hostname) && isPrivateAddress(hostname))
+  ) {
+    throw new FetchError('ssrf_blocked', `${hostname} is a private or reserved address`);
   }
+  return parsed;
+}
+
+export async function resolveSafeWebhookTarget(url, { allowPrivate = env.WEBHOOK_ALLOW_PRIVATE_NET, lookup } = {}) {
+  const parsed = assertSafeUrl(url, { allowPrivate });
+  return resolveTarget(parsed, allowPrivate, lookup, { allowAnyHttp: allowPrivate });
 }
 
 function publicPayload(payload) {

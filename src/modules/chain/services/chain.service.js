@@ -9,6 +9,7 @@ import { ChainCursorModel, ChainEventModel, ChainOpModel } from '../models/index
 
 const MAX_ATTEMPTS = 8;
 const LOCK_MS = 120_000;
+export const PROJECTION_STALE_MS = 2 * 60_000;
 const DROPPED_GRACE_MS = env.CHAIN_DROPPED_GRACE_MS;
 const handlers = new Map();
 let queue = Promise.resolve();
@@ -81,7 +82,7 @@ export const chainService = {
     return { processed };
   },
 
-  async reconcileSubmitted({ limit = 50 } = {}) {
+  async reconcileSubmitted({ limit = 50, stalePendingMs = PROJECTION_STALE_MS } = {}) {
     const submitted = await ChainOpModel.find({ status: { $in: ['submitted', 'chain_confirmed'] } })
       .sort({ submittedAt: 1 })
       .limit(limit)
@@ -91,6 +92,22 @@ export const chainService = {
     for (const { _id } of submitted) {
       await serial(() => reconcileOp(_id));
       reconciled += 1;
+    }
+    const staleBefore = new Date(Date.now() - stalePendingMs);
+    const pendingProjections = await ChainOpModel.find({
+      status: 'completed',
+      $or: [
+        { projectionStatus: 'failed' },
+        { projectionStatus: 'pending', updatedAt: { $lte: staleBefore } },
+      ],
+    })
+      .sort({ completedAt: 1 })
+      .limit(limit)
+      .select('_id')
+      .lean();
+    for (const { _id } of pendingProjections) {
+      const retried = await serial(() => retryProjection(_id, { stalePendingMs }));
+      if (retried) reconciled += 1;
     }
     return { reconciled };
   },
@@ -180,17 +197,40 @@ export const chainService = {
     };
   },
 
-  async reconciliationReport() {
+  async reconciliationReport({ stalePendingMs = PROJECTION_STALE_MS } = {}) {
     const stuckBefore = new Date(Date.now() - 10 * 60_000);
-    const [stuck, failed, counts] = await Promise.all([
+    const staleBefore = new Date(Date.now() - stalePendingMs);
+    const [
+      stuck,
+      failed,
+      failedProjections,
+      stalePendingProjections,
+      failedProjectionCount,
+      stalePendingProjectionCount,
+      counts,
+    ] = await Promise.all([
       ChainOpModel.find({ status: { $in: ['created', 'submitted'] }, createdAt: { $lt: stuckBefore } }).limit(100).lean(),
       ChainOpModel.find({ status: 'failed' }).sort({ updatedAt: -1 }).limit(100).lean(),
+      ChainOpModel.find({ status: 'completed', projectionStatus: 'failed' }).sort({ updatedAt: -1 }).limit(100).lean(),
+      ChainOpModel.find({ status: 'completed', projectionStatus: 'pending', updatedAt: { $lte: staleBefore } }).sort({ updatedAt: 1 }).limit(100).lean(),
+      ChainOpModel.countDocuments({ status: 'completed', projectionStatus: 'failed' }),
+      ChainOpModel.countDocuments({ status: 'completed', projectionStatus: 'pending', updatedAt: { $lte: staleBefore } }),
       ChainOpModel.aggregate([{ $group: { _id: { kind: '$kind', status: '$status' }, n: { $sum: 1 } } }]),
     ]);
     return {
-      healthy: stuck.length === 0 && failed.length === 0,
+      healthy:
+        stuck.length === 0 &&
+        failed.length === 0 &&
+        failedProjectionCount === 0 &&
+        stalePendingProjectionCount === 0,
       stuck: stuck.map(mapOp),
       failed: failed.map(mapOp),
+      failedProjections: failedProjections.map(mapOp),
+      stalePendingProjections: stalePendingProjections.map(mapOp),
+      projectionCounts: {
+        failed: failedProjectionCount,
+        stalePending: stalePendingProjectionCount,
+      },
       byKind: counts.map((row) => ({ kind: row._id.kind, status: row._id.status, count: row.n })),
     };
   },
@@ -272,10 +312,26 @@ async function processOp(opId) {
   }
 
   const adapter = chainAdapter();
+  let persistedSubmitted = false;
   try {
     const prepared = await adapter.prepare(op);
     if (prepared.alreadyDone) {
       await completeOp(op, prepared.result ?? {}, null);
+      return;
+    }
+    if (prepared.pending) {
+      const pendingTxHash = prepared.txHash ?? op.txHash ?? null;
+      const update = {
+        $set: {
+          status: 'submitted',
+          txHash: pendingTxHash,
+          submittedAt: op.submittedAt ?? new Date(),
+          lockedUntil: null,
+          ...(prepared.blockNumber !== null && prepared.blockNumber !== undefined ? { blockNumber: prepared.blockNumber } : {}),
+        },
+      };
+      if (pendingTxHash) update.$addToSet = { txHashes: pendingTxHash };
+      await ChainOpModel.updateOne({ _id: op._id }, update);
       return;
     }
     // Persist the signed transaction before broadcasting: a crash now resolves by rebroadcast.
@@ -296,9 +352,28 @@ async function processOp(opId) {
         $inc: { attempts: 1 },
       },
     );
-    if (prepared.rawTx) await adapter.broadcast(prepared.rawTx);
+    persistedSubmitted = true;
+    if (prepared.rawTx) {
+      try {
+        await adapter.broadcast(prepared.rawTx);
+      } catch (error) {
+        if (op.kind === 'payout') {
+          const message = String(error?.shortMessage ?? error?.message ?? error).slice(0, 500);
+          await ChainOpModel.updateOne({ _id: op._id }, { $set: { lastError: message, lockedUntil: null } });
+          logger.warn({ err: error, op: op.pid, kind: op.kind, txHash: prepared.txHash }, 'payout_broadcast_failed');
+          return;
+        }
+        throw error;
+      }
+    }
     await reconcileOp(op._id);
   } catch (error) {
+    if (persistedSubmitted && op.kind === 'payout') {
+      const message = String(error?.shortMessage ?? error?.message ?? error).slice(0, 500);
+      await ChainOpModel.updateOne({ _id: op._id }, { $set: { lastError: message, lockedUntil: null } });
+      logger.warn({ err: error, op: op.pid, kind: op.kind }, 'payout_post_submit_error');
+      return;
+    }
     await scheduleRetry(op, error);
   }
 }
@@ -317,11 +392,7 @@ async function reconcileOp(opId) {
   }
 
   if (receipt.state === 'confirmed') {
-    await ChainOpModel.updateOne(
-      { _id: op._id, status: 'submitted' },
-      { $set: { status: 'chain_confirmed', confirmedAt: new Date(), blockNumber: receipt.blockNumber ?? null } },
-    );
-    await completeOp(op, receipt.result ?? {}, receipt.blockNumber);
+    await confirmOp(op, receipt);
     return;
   }
   if (receipt.state === 'dropped' && Date.now() - new Date(op.submittedAt).getTime() > DROPPED_GRACE_MS) {
@@ -333,10 +404,30 @@ async function reconcileOp(opId) {
           // Another transaction used this nonce. Re-check ours once more before re-preparing;
           // ref-guarded ops are additionally protected by lookupExisting() in prepare().
           const again = await adapter.checkReceipt(op);
-          if (again.state === 'dropped') await scheduleRetry(op, new Error('nonce_consumed'), { resetSubmission: true });
+          if (again.state === 'confirmed') {
+            await confirmOp(op, again);
+          } else if (again.state === 'dropped') {
+            if (op.kind === 'payout') {
+              // Payout has no on-chain idempotency ref: never clear rawTx/nonce or re-sign a second tx,
+              // and do not auto-reverse via onFailed in case the original tx landed on a lagging RPC.
+              await ChainOpModel.updateOne(
+                { _id: op._id },
+                { $set: { status: 'failed', lastError: 'payout_nonce_consumed_manual_reconcile', lockedUntil: null } },
+              );
+              logger.error({ op: op.pid, kind: op.kind, txHash: op.txHash }, 'payout_nonce_consumed_manual_reconcile');
+            } else {
+              await scheduleRetry(op, new Error('nonce_consumed'), { resetSubmission: true });
+            }
+          }
         }
       } catch (error) {
-        await scheduleRetry(op, error, { resetSubmission: true });
+        if (op.kind === 'payout') {
+          const message = String(error?.shortMessage ?? error?.message ?? error).slice(0, 500);
+          await ChainOpModel.updateOne({ _id: op._id }, { $set: { lastError: message, lockedUntil: null } });
+          logger.warn({ err: error, op: op.pid, kind: op.kind, txHash: op.txHash }, 'payout_rebroadcast_failed');
+        } else {
+          await scheduleRetry(op, error, { resetSubmission: true });
+        }
       }
     } else {
       await scheduleRetry(op, new Error('tx_dropped'), { resetSubmission: true });
@@ -348,8 +439,26 @@ async function reconcileOp(opId) {
   }
 }
 
-async function completeOp(op, result, blockNumber) {
+async function confirmOp(op, receipt) {
+  const confirmedTxHash = receipt.txHash && receipt.txHash !== op.txHash ? receipt.txHash : op.txHash;
+  await ChainOpModel.updateOne(
+    { _id: op._id, status: 'submitted' },
+    {
+      $set: {
+        status: 'chain_confirmed',
+        confirmedAt: new Date(),
+        blockNumber: receipt.blockNumber ?? null,
+        ...(confirmedTxHash ? { txHash: confirmedTxHash } : {}),
+      },
+    },
+  );
+  const nextOp = confirmedTxHash !== op.txHash ? { ...op, txHash: confirmedTxHash } : op;
+  await completeOp(nextOp, receipt.result ?? {}, receipt.blockNumber, confirmedTxHash);
+}
+
+async function completeOp(op, result, blockNumber, confirmedTxHash) {
   const merged = { ...(op.result ?? {}), ...result };
+  const resolvedTxHash = confirmedTxHash ?? result?.txHash ?? op.txHash;
   const updated = await ChainOpModel.findOneAndUpdate(
     { _id: op._id, status: { $ne: 'completed' } },
     {
@@ -359,19 +468,54 @@ async function completeOp(op, result, blockNumber) {
         completedAt: new Date(),
         lockedUntil: null,
         lastError: null,
+        projectionStatus: 'pending',
+        projectionError: null,
+        ...(resolvedTxHash && resolvedTxHash !== op.txHash ? { txHash: resolvedTxHash } : {}),
         ...(blockNumber !== null && blockNumber !== undefined ? { blockNumber } : {}),
       },
     },
     { new: true },
   ).lean();
   if (!updated) return;
+  await runProjection(updated, merged);
+}
+
+async function runProjection(op, result) {
   const handler = handlers.get(op.kind);
   try {
-    await handler?.onCompleted?.(updated, merged);
+    await handler?.onCompleted?.(op, result);
+    await ChainOpModel.updateOne(
+      { _id: op._id },
+      { $set: { projectionStatus: 'done', projectionError: null } },
+    );
+    eventBus.emit('chain.confirmed', { opId: op.pid, kind: op.kind, ref: op.ref, txHash: op.txHash });
   } catch (error) {
+    const message = String(error?.shortMessage ?? error?.message ?? error).slice(0, 500);
     logger.error({ err: error, op: op.pid }, 'chain_projection_failed');
+    await ChainOpModel.updateOne(
+      { _id: op._id },
+      { $set: { projectionStatus: 'failed', projectionError: message } },
+    );
   }
-  eventBus.emit('chain.confirmed', { opId: updated.pid, kind: updated.kind, ref: updated.ref, txHash: updated.txHash });
+}
+
+async function retryProjection(opId, { stalePendingMs = PROJECTION_STALE_MS } = {}) {
+  const staleBefore = new Date(Date.now() - stalePendingMs);
+  const op = await ChainOpModel.findOneAndUpdate(
+    {
+      _id: opId,
+      status: 'completed',
+      $or: [
+        { projectionStatus: 'failed' },
+        { projectionStatus: 'pending', updatedAt: { $lte: staleBefore } },
+      ],
+    },
+    { $set: { projectionStatus: 'pending', projectionError: null } },
+    { new: true },
+  ).lean();
+  if (!op) return false;
+  await runProjection(op, op.result ?? {});
+  return true;
 }
 
 async function scheduleRetry(op, error, { resetSubmission = false } = {}) {

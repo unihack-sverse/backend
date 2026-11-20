@@ -138,7 +138,17 @@ export const publishService = {
     });
     const reset = { steps, status: 'running', finishedAt: null };
     if (stepName === 'propose_items') reset.catalogApproved = false;
-    await PublishJobModel.updateOne({ _id: job._id }, { $set: reset });
+    const claimed = await PublishJobModel.findOneAndUpdate(
+      {
+        _id: job._id,
+        status: { $ne: 'done' },
+        [`steps.${index}.step`]: stepName,
+        [`steps.${index}.status`]: { $in: ['pending', 'failed', 'done'] },
+      },
+      { $set: reset },
+      { new: true },
+    ).lean();
+    if (!claimed) throw Conflict('step_already_running');
 
     const game = await GameModel.findById(job.gameId).lean();
     try {

@@ -41,6 +41,12 @@ const chainOpSchema = new Schema(
     blockNumber: { type: Number, default: null },
     result: { type: Schema.Types.Mixed, default: null },
     lastError: { type: String, default: null },
+    projectionStatus: {
+      type: String,
+      enum: ['pending', 'done', 'failed'],
+      default: 'pending',
+    },
+    projectionError: { type: String, default: null },
     submittedAt: { type: Date, default: null },
     confirmedAt: { type: Date, default: null },
     completedAt: { type: Date, default: null },
@@ -49,6 +55,7 @@ const chainOpSchema = new Schema(
 );
 
 chainOpSchema.index({ status: 1, nextAttemptAt: 1 });
+chainOpSchema.index({ status: 1, projectionStatus: 1 });
 chainOpSchema.index({ refType: 1, refId: 1 });
 chainOpSchema.index({ txHash: 1 }, { sparse: true });
 

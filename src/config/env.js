@@ -17,7 +17,7 @@ const optionalAddress = z
   .optional()
   .or(z.literal('').transform(() => undefined));
 
-const envSchema = z.object({
+export const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
@@ -62,6 +62,8 @@ const envSchema = z.object({
   REVIEW_MAX_BUILD_BYTES: z.coerce.number().int().positive().default(52_428_800),
   // Defaults to false in production and true elsewhere (so local servers can be scanned in dev).
   REVIEW_ALLOW_PRIVATE_NET: booleanFlag.optional(),
+  // Block private/loopback/link-local/metadata webhook targets by default even outside production.
+  WEBHOOK_ALLOW_PRIVATE_NET: booleanFlag.default(false),
   VIRUSTOTAL_API_KEY: z.string().optional().transform((value) => value?.trim() || undefined),
   SEED_ADMIN_EMAIL: z.string().email().default('ops@sverse.local'),
   SEED_ADMIN_PASSWORD: z.string().optional().transform((value) => value || undefined),
