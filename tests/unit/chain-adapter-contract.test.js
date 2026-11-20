@@ -394,4 +394,265 @@ describe('AvalancheChainAdapter offline state transitions', () => {
       await ChainOpModel.deleteOne({ _id: op._id });
     }
   });
+
+  it('keeps payout submitted with original rawTx/nonce on rebroadcast timeout, then rebroadcasts same rawTx and confirms', async () => {
+    const previous = chainAdapter();
+    const adapter = createOfflineAvalancheAdapter({ confirmations: 2 });
+    const onCompleted = vi.fn();
+    const onFailed = vi.fn();
+    chainService.registerHandler('payout', { onCompleted, onFailed });
+    setChainAdapter(adapter);
+
+    const txHash = `0x${'3'.repeat(64)}`;
+    const rawTx = '0x02f8payoutrebroadcast';
+    const refId = new mongoose.Types.ObjectId();
+    const op = await ChainOpModel.create({
+      pid: `cop_payout_reb_${Date.now()}`,
+      kind: 'payout',
+      adapter: 'avalanche',
+      ref: `payout:reb_${refId.toString()}`,
+      refType: 'withdrawal',
+      refId,
+      payload: { to: `0x${'9'.repeat(40)}`, amountUnits: '2500' },
+      status: 'submitted',
+      txHash,
+      txHashes: [txHash],
+      sender: adapter.relayerAddress,
+      nonce: 11,
+      rawTx,
+      submittedAt: new Date(Date.now() - 10 * 60_000),
+    });
+
+    try {
+      const prepareSpy = vi.spyOn(adapter, 'prepare');
+      const broadcastSpy = vi.spyOn(adapter, 'broadcast');
+
+      // 1st reconcile: tx appears dropped and rebroadcast times out -> stay submitted, preserve rawTx/nonce/txHash.
+      adapter.provider.getTransactionReceipt.mockResolvedValueOnce(null);
+      adapter.provider.getTransaction.mockResolvedValueOnce(null);
+      adapter.provider.broadcastTransaction.mockRejectedValueOnce(new Error('ETIMEDOUT'));
+
+      await chainService.reconcileSubmitted();
+
+      const afterTimeout = await ChainOpModel.findById(op._id).select('+rawTx').lean();
+      expect(afterTimeout.status).toBe('submitted');
+      expect(afterTimeout.rawTx).toBe(rawTx);
+      expect(afterTimeout.nonce).toBe(11);
+      expect(afterTimeout.txHash).toBe(txHash);
+      expect(afterTimeout.lastError).toContain('ETIMEDOUT');
+      expect(prepareSpy).not.toHaveBeenCalled();
+
+      // dispatchDue must not pick up the op or sign a second tx.
+      await chainService.dispatchDue();
+      expect(prepareSpy).not.toHaveBeenCalled();
+
+      // 2nd reconcile: rebroadcasts the exact same rawTx successfully.
+      adapter.provider.getTransactionReceipt.mockResolvedValueOnce(null);
+      adapter.provider.getTransaction.mockResolvedValueOnce(null);
+      adapter.provider.broadcastTransaction.mockResolvedValueOnce({ hash: txHash });
+
+      await chainService.reconcileSubmitted();
+      expect(broadcastSpy).toHaveBeenCalledTimes(2);
+      expect(broadcastSpy).toHaveBeenNthCalledWith(1, rawTx);
+      expect(broadcastSpy).toHaveBeenNthCalledWith(2, rawTx);
+      expect(prepareSpy).not.toHaveBeenCalled();
+
+      // 3rd reconcile: original txHash confirms.
+      adapter.provider.getTransactionReceipt.mockResolvedValueOnce({ status: 1, blockNumber: 98, logs: [] });
+
+      await chainService.reconcileSubmitted();
+
+      const confirmed = await ChainOpModel.findById(op._id).select('+rawTx').lean();
+      expect(confirmed.status).toBe('completed');
+      expect(confirmed.txHash).toBe(txHash);
+      expect(confirmed.nonce).toBe(11);
+      expect(confirmed.rawTx).toBe(rawTx);
+      expect(onCompleted).toHaveBeenCalledTimes(1);
+      expect(onFailed).not.toHaveBeenCalled();
+      expect(prepareSpy).not.toHaveBeenCalled();
+    } finally {
+      setChainAdapter(previous);
+      await ChainOpModel.deleteOne({ _id: op._id });
+    }
+  });
+
+  it('keeps payout submitted when broadcast fails after persist in processOp, never re-signs, and confirms on reconcile', async () => {
+    const previous = chainAdapter();
+    const adapter = createOfflineAvalancheAdapter({ confirmations: 2 });
+    const onCompleted = vi.fn();
+    const onFailed = vi.fn();
+    chainService.registerHandler('payout', { onCompleted, onFailed });
+    setChainAdapter(adapter);
+
+    const refId = new mongoose.Types.ObjectId();
+    const op = await ChainOpModel.create({
+      pid: `cop_payout_bc_${Date.now()}`,
+      kind: 'payout',
+      adapter: 'avalanche',
+      ref: `payout:bc_${refId.toString()}`,
+      refType: 'withdrawal',
+      refId,
+      payload: { to: `0x${'9'.repeat(40)}`, amountUnits: '3000' },
+      status: 'created',
+    });
+
+    try {
+      const prepareSpy = vi.spyOn(adapter, 'prepare');
+      const broadcastSpy = vi.spyOn(adapter, 'broadcast');
+
+      // Initial broadcast after persisting submitted times out.
+      adapter.provider.broadcastTransaction.mockRejectedValueOnce(new Error('rpc_broadcast_timeout'));
+
+      await chainService.dispatchDue();
+
+      const afterBroadcastErr = await ChainOpModel.findById(op._id).select('+rawTx').lean();
+      expect(afterBroadcastErr.status).toBe('submitted');
+      expect(afterBroadcastErr.rawTx).toBeTruthy();
+      expect(afterBroadcastErr.nonce).toBe(7);
+      expect(afterBroadcastErr.txHash).toMatch(/^0x[0-9a-f]{64}$/);
+      expect(afterBroadcastErr.lastError).toContain('rpc_broadcast_timeout');
+      expect(prepareSpy).toHaveBeenCalledTimes(1);
+      expect(broadcastSpy).toHaveBeenCalledTimes(1);
+
+      // Subsequent dispatchDue must not create a second tx.
+      await chainService.dispatchDue();
+      expect(prepareSpy).toHaveBeenCalledTimes(1);
+
+      // Move submittedAt past dropped grace period so reconcile rebroadcasts the same rawTx.
+      await ChainOpModel.updateOne(
+        { _id: op._id },
+        { $set: { submittedAt: new Date(Date.now() - 10 * 60_000) } },
+      );
+      adapter.provider.getTransactionReceipt.mockResolvedValueOnce(null);
+      adapter.provider.getTransaction.mockResolvedValueOnce(null);
+      adapter.provider.broadcastTransaction.mockResolvedValueOnce({ hash: afterBroadcastErr.txHash });
+
+      await chainService.reconcileSubmitted();
+      expect(broadcastSpy).toHaveBeenCalledTimes(2);
+      expect(broadcastSpy).toHaveBeenNthCalledWith(2, afterBroadcastErr.rawTx);
+      expect(prepareSpy).toHaveBeenCalledTimes(1);
+
+      // Next reconcile confirms the original txHash.
+      adapter.provider.getTransactionReceipt.mockResolvedValueOnce({ status: 1, blockNumber: 98, logs: [] });
+
+      await chainService.reconcileSubmitted();
+
+      const finalOp = await ChainOpModel.findById(op._id).select('+rawTx').lean();
+      expect(finalOp.status).toBe('completed');
+      expect(finalOp.txHash).toBe(afterBroadcastErr.txHash);
+      expect(finalOp.txHashes).toEqual([afterBroadcastErr.txHash]);
+      expect(finalOp.nonce).toBe(7);
+      expect(onCompleted).toHaveBeenCalledTimes(1);
+      expect(onFailed).not.toHaveBeenCalled();
+      expect(prepareSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      setChainAdapter(previous);
+      await ChainOpModel.deleteOne({ _id: op._id });
+    }
+  });
+
+  it('returns pending without signing a second tx when a prior payout tx is pending (mined < confirmations or in mempool)', async () => {
+    const previous = chainAdapter();
+    const adapter = createOfflineAvalancheAdapter({ confirmations: 3 });
+    const onCompleted = vi.fn();
+    chainService.registerHandler('payout', { onCompleted, onFailed: vi.fn() });
+    setChainAdapter(adapter);
+
+    const oldHash = `0x${'5'.repeat(64)}`;
+    const payoutOp = {
+      kind: 'payout',
+      ref: 'payout:wd_pending_check',
+      txHash: null,
+      txHashes: [oldHash],
+      payload: { to: `0x${'9'.repeat(40)}`, amountUnits: '5000' },
+    };
+
+    // 1. Mined with insufficient confirmations (100 - 99 + 1 = 2 < 3)
+    adapter.provider.getTransactionReceipt.mockResolvedValueOnce({ status: 1, blockNumber: 99, logs: [] });
+    expect(await adapter.lookupExisting(payoutOp)).toEqual({
+      pending: true,
+      txHash: oldHash,
+      blockNumber: 99,
+    });
+
+    adapter.provider.getTransactionReceipt.mockResolvedValueOnce({ status: 1, blockNumber: 99, logs: [] });
+    expect(await adapter.prepare(payoutOp)).toEqual({
+      pending: true,
+      txHash: oldHash,
+      blockNumber: 99,
+    });
+
+    // 2. Pending in mempool (receipt null, getTransaction returns tx)
+    adapter.provider.getTransactionReceipt.mockResolvedValueOnce(null);
+    adapter.provider.getTransaction.mockResolvedValueOnce({ hash: oldHash });
+    expect(await adapter.lookupExisting(payoutOp)).toEqual({
+      pending: true,
+      txHash: oldHash,
+      blockNumber: null,
+    });
+
+    adapter.provider.getTransactionReceipt.mockResolvedValueOnce(null);
+    adapter.provider.getTransaction.mockResolvedValueOnce({ hash: oldHash });
+    expect(await adapter.prepare(payoutOp)).toEqual({
+      pending: true,
+      txHash: oldHash,
+      blockNumber: null,
+    });
+
+    expect(adapter.contracts.MockSRV.mint.populateTransaction).not.toHaveBeenCalled();
+    expect(adapter.contracts.MockSRV.transfer.populateTransaction).not.toHaveBeenCalled();
+    expect(adapter.provider.estimateGas).not.toHaveBeenCalled();
+
+    // 3. Full dispatcher flow: dispatchDue moves op to submitted without signing/broadcasting, then reconcile confirms.
+    const refId = new mongoose.Types.ObjectId();
+    const op = await ChainOpModel.create({
+      pid: `cop_payout_pend_${Date.now()}`,
+      kind: 'payout',
+      adapter: 'avalanche',
+      ref: `payout:pend_${refId.toString()}`,
+      refType: 'withdrawal',
+      refId,
+      payload: { to: `0x${'9'.repeat(40)}`, amountUnits: '5000' },
+      status: 'created',
+      txHash: null,
+      txHashes: [oldHash],
+    });
+
+    try {
+      const broadcastSpy = vi.spyOn(adapter, 'broadcast');
+      adapter.provider.getTransactionReceipt.mockResolvedValueOnce(null);
+      adapter.provider.getTransaction.mockResolvedValueOnce({ hash: oldHash });
+
+      await chainService.dispatchDue();
+
+      const afterDispatch = await ChainOpModel.findById(op._id).lean();
+      expect(afterDispatch.status).toBe('submitted');
+      expect(afterDispatch.txHash).toBe(oldHash);
+      expect(afterDispatch.lockedUntil).toBeNull();
+      expect(afterDispatch.submittedAt).toBeInstanceOf(Date);
+      expect(broadcastSpy).not.toHaveBeenCalled();
+      expect(adapter.contracts.MockSRV.mint.populateTransaction).not.toHaveBeenCalled();
+      expect(adapter.contracts.MockSRV.transfer.populateTransaction).not.toHaveBeenCalled();
+
+      // Reconcile while mined with < confirmations -> stays submitted.
+      adapter.provider.getTransactionReceipt.mockResolvedValueOnce({ status: 1, blockNumber: 99, logs: [] });
+      await chainService.reconcileSubmitted();
+      const stillPending = await ChainOpModel.findById(op._id).lean();
+      expect(stillPending.status).toBe('submitted');
+      expect(onCompleted).not.toHaveBeenCalled();
+
+      // Reconcile once confirmed (100 - 97 + 1 = 4 >= 3) -> completes with oldHash.
+      adapter.provider.getTransactionReceipt.mockResolvedValueOnce({ status: 1, blockNumber: 97, logs: [] });
+      await chainService.reconcileSubmitted();
+      const completed = await ChainOpModel.findById(op._id).lean();
+      expect(completed.status).toBe('completed');
+      expect(completed.txHash).toBe(oldHash);
+      expect(completed.blockNumber).toBe(97);
+      expect(onCompleted).toHaveBeenCalledTimes(1);
+      expect(broadcastSpy).not.toHaveBeenCalled();
+    } finally {
+      setChainAdapter(previous);
+      await ChainOpModel.deleteOne({ _id: op._id });
+    }
+  });
 });

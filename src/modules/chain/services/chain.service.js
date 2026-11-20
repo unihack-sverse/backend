@@ -281,10 +281,26 @@ async function processOp(opId) {
   }
 
   const adapter = chainAdapter();
+  let persistedSubmitted = false;
   try {
     const prepared = await adapter.prepare(op);
     if (prepared.alreadyDone) {
       await completeOp(op, prepared.result ?? {}, null);
+      return;
+    }
+    if (prepared.pending) {
+      const pendingTxHash = prepared.txHash ?? op.txHash ?? null;
+      const update = {
+        $set: {
+          status: 'submitted',
+          txHash: pendingTxHash,
+          submittedAt: op.submittedAt ?? new Date(),
+          lockedUntil: null,
+          ...(prepared.blockNumber !== null && prepared.blockNumber !== undefined ? { blockNumber: prepared.blockNumber } : {}),
+        },
+      };
+      if (pendingTxHash) update.$addToSet = { txHashes: pendingTxHash };
+      await ChainOpModel.updateOne({ _id: op._id }, update);
       return;
     }
     // Persist the signed transaction before broadcasting: a crash now resolves by rebroadcast.
@@ -305,9 +321,28 @@ async function processOp(opId) {
         $inc: { attempts: 1 },
       },
     );
-    if (prepared.rawTx) await adapter.broadcast(prepared.rawTx);
+    persistedSubmitted = true;
+    if (prepared.rawTx) {
+      try {
+        await adapter.broadcast(prepared.rawTx);
+      } catch (error) {
+        if (op.kind === 'payout') {
+          const message = String(error?.shortMessage ?? error?.message ?? error).slice(0, 500);
+          await ChainOpModel.updateOne({ _id: op._id }, { $set: { lastError: message, lockedUntil: null } });
+          logger.warn({ err: error, op: op.pid, kind: op.kind, txHash: prepared.txHash }, 'payout_broadcast_failed');
+          return;
+        }
+        throw error;
+      }
+    }
     await reconcileOp(op._id);
   } catch (error) {
+    if (persistedSubmitted && op.kind === 'payout') {
+      const message = String(error?.shortMessage ?? error?.message ?? error).slice(0, 500);
+      await ChainOpModel.updateOne({ _id: op._id }, { $set: { lastError: message, lockedUntil: null } });
+      logger.warn({ err: error, op: op.pid, kind: op.kind }, 'payout_post_submit_error');
+      return;
+    }
     await scheduleRetry(op, error);
   }
 }
@@ -355,7 +390,13 @@ async function reconcileOp(opId) {
           }
         }
       } catch (error) {
-        await scheduleRetry(op, error, { resetSubmission: true });
+        if (op.kind === 'payout') {
+          const message = String(error?.shortMessage ?? error?.message ?? error).slice(0, 500);
+          await ChainOpModel.updateOne({ _id: op._id }, { $set: { lastError: message, lockedUntil: null } });
+          logger.warn({ err: error, op: op.pid, kind: op.kind, txHash: op.txHash }, 'payout_rebroadcast_failed');
+        } else {
+          await scheduleRetry(op, error, { resetSubmission: true });
+        }
       }
     } else {
       await scheduleRetry(op, new Error('tx_dropped'), { resetSubmission: true });

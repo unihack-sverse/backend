@@ -165,7 +165,13 @@ export class AvalancheChainAdapter {
     if (skipTxLookup) return null;
     if (!['payout', 'transfer_item', 'burn_item'].includes(op.kind)) return null;
     const found = await this.#findConfirmedTx(op);
-    if (!found || found.pending) return null;
+    if (!found) return null;
+    if (found.pending) {
+      if (op.kind === 'payout') {
+        return { pending: true, txHash: found.txHash, blockNumber: found.blockNumber ?? null };
+      }
+      return null;
+    }
     return Object.keys(found.result).length ? { ...found.result, txHash: found.txHash } : { txHash: found.txHash };
   }
 
@@ -179,7 +185,14 @@ export class AvalancheChainAdapter {
     let pendingResult = null;
     for (const hash of hashes) {
       const receipt = await this.provider.getTransactionReceipt(hash);
-      if (!receipt || receipt.status !== 1) continue;
+      if (!receipt) {
+        const pendingTx = await this.provider.getTransaction(hash);
+        if (pendingTx) {
+          pendingResult ??= { pending: true, txHash: hash, blockNumber: null };
+        }
+        continue;
+      }
+      if (receipt.status !== 1) continue;
       latest ??= await this.provider.getBlockNumber();
       if (latest - receipt.blockNumber + 1 >= this.confirmations) {
         return {
@@ -188,7 +201,9 @@ export class AvalancheChainAdapter {
           result: this.#resultFromReceipt(op, receipt),
         };
       }
-      pendingResult ??= { pending: true, blockNumber: receipt.blockNumber };
+      if (!pendingResult || pendingResult.blockNumber === null) {
+        pendingResult = { pending: true, txHash: hash, blockNumber: receipt.blockNumber };
+      }
     }
     return pendingResult;
   }
@@ -353,6 +368,7 @@ export class AvalancheChainAdapter {
 
   async #preparePayout(op) {
     const existing = await this.lookupExisting(op);
+    if (existing?.pending) return { pending: true, txHash: existing.txHash, blockNumber: existing.blockNumber };
     if (existing) return { alreadyDone: true, result: existing };
 
     const { MockSRV: token } = this.contracts;
