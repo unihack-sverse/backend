@@ -9,6 +9,9 @@ GET    /health
 GET    /ready
 POST   /api/v1/auth/register
 POST   /api/v1/auth/login
+POST   /api/v1/auth/wallet/challenge
+POST   /api/v1/auth/wallet/verify
+POST   /api/v1/auth/wallet/link
 POST   /api/v1/auth/refresh
 POST   /api/v1/auth/logout
 GET    /api/v1/auth/me
@@ -36,6 +39,7 @@ PATCH  /api/v1/items/:id
 POST   /api/v1/items/:id/archive
 PUT    /api/v1/games/:id/envelope
 GET    /api/v1/passport/me
+PATCH  /api/v1/passport/me/handle
 GET    /api/v1/passport/me/inventory
 GET    /api/v1/passport/me/wardrobe
 PATCH  /api/v1/passport/me/wardrobe
@@ -73,6 +77,7 @@ PATCH  /api/v1/studios/me
 GET    /api/v1/studios/me/analytics
 POST   /api/v1/studios/me/bond/stake
 POST   /api/v1/studios/me/bond/unstake
+POST   /api/v1/studios/me/faucet
 GET    /api/v1/studios/me/api-keys
 POST   /api/v1/studios/me/api-keys
 DELETE /api/v1/studios/me/api-keys/:id
@@ -131,6 +136,7 @@ POST   /admin/v1/studios/:id/slash-bond
 POST   /admin/v1/studios/:id/suspend
 POST   /admin/v1/studios/:id/reinstate
 POST   /admin/v1/studios/:id/kyc-verified
+GET    /admin/v1/orders/:id
 POST   /admin/v1/orders/:id/refund
 GET    /admin/v1/epochs
 POST   /admin/v1/epochs/:number/close
